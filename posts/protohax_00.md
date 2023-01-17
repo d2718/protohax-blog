@@ -1,6 +1,8 @@
 title: Protohackers in Rust, Part 00
 subtitle: Dipping the toe in async and Tokio
 time: 2023-01-13 11:53:00
+og_image: https://d2718.net/blog/images/rust_logo.png
+og_desc: Some introduction to async Rust through solving the first Protohackers problem
 
 While idly batting solutions to the first couple of [Protohackers](https://protohackers.com/) problems back and forth, someone (whose opinion about these types of things is much more trustworthy than mine) suggested that I blog about solving them in Rust. Since I'm not really a teacher anymore and therefore lack a chronic captive audience, that was enough for me.
 
