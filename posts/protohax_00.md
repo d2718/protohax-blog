@@ -65,7 +65,7 @@ Now this was trivial to the point of being dumb. The future returned resolves im
 
 ## Interlude: Tasks and Terminology
 
-A _task_ is the term used for the asynchronous analog to a _thread_. It's a path of execution through your code that can be suspended in specific places (generally while waiting on some I/O operation to complete) to allow some other path to proceed. The relationship between tasks (execution paths scheduled by your program's async runtime) and threads (execution paths scheduled by your OS) can be complex and not always clear. Sometimes the runtime will run a single task on a thread; sometimes it will coordinate multiple tasks on the same thread. Different async runtimes offer different amounts of control over this relationship. I will try to be consitent with my use of the terms _task_ and _thread_ to maintain this distinction.
+A _task_ is the term used for the asynchronous analog to a _thread_. It's a path of execution through your code that can be suspended in specific places (generally while waiting on some I/O operation to complete) to allow some other path to proceed. The relationship between tasks (execution paths scheduled by your program's async runtime) and threads (execution paths scheduled by your OS) can be complex and not always clear. Sometimes the runtime will run a single task on a thread; sometimes it will coordinate multiple tasks on the same thread. Different async runtimes offer different amounts of control over this relationship. I will try to be consistent with my use of the terms _task_ and _thread_ to maintain this distinction.
 
 ## Protohackers Problem 0: The Smoke Test
 
