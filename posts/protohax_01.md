@@ -775,6 +775,6 @@ async fn main() {
 
 It works; I'll spare you the output.
 
-The problem for next time inolves storing some state with each connection, and also reading and writing a binary format where Serde won't help us,[^serde_binary] but the asynchronous accept-communicate-shutdown arc of each connection will be essentiall the same. The fourth problem will be tougher, because the connections will have to communicate with each other, but we'll worry about that then.
+The problem for next time inolves storing some state with each connection, and also reading and writing a binary format where Serde won't help us,[^serde_binary] but the asynchronous accept-communicate-shutdown arc of each connection will be essentially the same. The fourth problem will be considerably tougher, because the connections will have to communicate with each other, but we'll worry about that then.
 
 [^serde_binary]: We _could_ use Serde for this, but implementing the `Serialize` and `Deserialize` traits for our nine-byte binary format would be far more trouble than benefit.
