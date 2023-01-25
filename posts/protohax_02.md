@@ -4,12 +4,12 @@ time: 2023-01-21 11:50:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the third Protohackers problem
 
-(This is the third post in a series. If you haven't already, you may wish to first consume [part 0](https://d2718.net/blog/posts/protohax_00.html) and [part 1(https://d2718.net/blog/posts/protohax_01.html).)
+(This is the third post in a series. If you haven't already, you may wish to first consume [part 0](https://d2718.net/blog/posts/protohax_00.html) and [part 1](https://d2718.net/blog/posts/protohax_01.html).)
 
 In [the third Protohackers problem](https://protohackers.com/problem/2), each client will send us a series of prices with timestamps for some "asset", and then query us with time intervals over which we are supposed to respond with the average price of that asset over the requested interval. This will involve two new things that previous problems did not:
 
   1. We will have to keep track of some state over the course of each client's lifetime.
-  2. The message format involved with be _binary_, and not a textual format, so we can't lean on [Serde](https://serde.rs) like we have in the past.[^serde]
+  2. Messages will arrive in a custom _binary_ format, not a common one, so we can't lean on [Serde](https://serde.rs) like we have in the past.[^serde]
 
 [^serde]: Or rather we _can_, but it'd be more trouble than it's worth, so we _won't_.
 
@@ -25,9 +25,13 @@ Insert: | 73 ('I') | timestamp  | price     |
  Query: | 81 ('Q') | start time | end time  |
 ```
 
-An "Insert" message will tell us the price of the client's asset at a particular point in time; a "Query" message requests the average price of that asset between the provided start and end times (inclusive).[^time_avg] We'll start by defining an enum to represent a possible message.
+An "Insert" message will tell us the price of the client's asset at a particular point in time; a "Query" message requests the average price of that asset between the provided start and end times (inclusive).[^time_avg] We'll start by defining an enum to represent these two message types.
 
 [^time_avg]: The "average" requested is the average of all the inserted price values with timestamps in the supplied range, _not_ (thankfully) the timewise average of the asset over the requested interval (which would definitely be harder).
+
+```bash
+$ cargo new 02_means --name means
+```
 
 `src/msg.rs`:
 
@@ -238,7 +242,11 @@ Okay, let's think about our handler function. We need to read `Msg`s from the co
   * we can round this value in _either_ direction, at our discretion
   * we should send back 0 if there are no prices in the requested interval (or if there can't possibly be any prices, because the end is before the start, for instance)
 
-To store our timestamped values, I'm going to reach for the [`BTreeMap`](https://doc.rust-lang.org/stable/std/collections/struct.BTreeMap.html). It's easily iterable, and entries will always be inserted in key order (unlike with a `Vec`, where insertions will be more complicated if prices arrive out of chronological order, which we're warned they might). Let's write what we can so far.
+[^nice_spec]: Which is unrealistically generous and beautiful in its helpfulness and clarity.
+
+To store our timestamped values, I'm going to reach for the [`BTreeMap`](https://doc.rust-lang.org/stable/std/collections/struct.BTreeMap.html). It's easily iterable, and entries will always be inserted in key order (unlike with a `Vec`, where insertions will be more complicated if prices arrive out of chronological order, which we're warned they might[^niiice_spec]). Let's write what we can so far.
+
+[^niiice_spec]: See what I mean?
 
 Excerpts of `src/main.rs`:
 
@@ -352,7 +360,7 @@ $ RUST_LOG=error ./means
 [2023-01-20T20:04:22Z ERROR means] Client 10: read error: early eof
 ```
 
-It looks like we're throwing[^throw] an error every time a client disconnects. My guess is that every time `Msg::read_from()` calls `.read_exact()` on a disconnected client, it's returning an [`ErrorKind::UnexpectedEof`](https://doc.rust-lang.org/stable/std/io/enum.ErrorKind.html#variant.UnexpectedEof). We _expect_ clients to disconnect eventually; I would rather not bubble up an error in this case.
+It looks like we're throwing[^throw] an error every time a client disconnects. My guess is that every time `Msg::read_from()` calls `.read_exact()` on a disconnected client socket, it's returning an [`ErrorKind::UnexpectedEof`](https://doc.rust-lang.org/stable/std/io/enum.ErrorKind.html#variant.UnexpectedEof). We _expect_ clients to disconnect eventually; I would rather not bubble up an error in this case.
 
 [^throw]: Rust doesn't really _throw_ errors; what it does is more like gently underhanding them up to the calling stack frame.
 

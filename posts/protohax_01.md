@@ -11,7 +11,7 @@ og_desc: More async Rust in action solving the second Protohackers problem
 Let's get set up:
 
 ```bash
-$ cargo new 01_prime --name prime
+$ cargo new 01_primes --name primes
 ```
 
 We'll use the same logging crate we used before. The initial content of our `Cargo.toml`:

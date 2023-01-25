@@ -42,6 +42,11 @@ fn range_average(map: &BTreeMap<i32, i32>, low: i32, high: i32) -> i32 {
         }
     }
 
+    let tot = map.iter().filter(|(&t, _)| low <= t && t <= high)
+        .map(|(_, p)| *p)
+        .sum();
+    
+
     if n == 0 { 0 }
     else { (tot / n) as i32 }
 }
