@@ -566,7 +566,7 @@ async fn main() {
 
 ## The `current_thread` runtime isn't quite enough
 
-Oops.
+Hrrm.
 
 ```
 error: future cannot be sent between threads safely
@@ -597,6 +597,12 @@ note: required by a bound in `tokio::spawn`
 
 It goes on. This is just the first of several similar compiler admonitions.
 
-We knew those `Rc`s we wrapped around our `Message`s in order to save a lot of `String` cloning were `!Send`.[^unsend] (We knew all that, right?)
+We knew those `Rc`s we wrapped around our `Message`s in order to save a lot of `String` cloning were `!Send`. (We knew all that, right?[^unsend]) But I guess we also assumed that the `current_thread` runtime would just automatically allow us to run un`Send`able futures. Obviously this is not the case.
 
-[^unsend]: In case you're not familiar with this particular jargonic morsel, `!Send` means that the type in question doesn't implement the [`std::marker::Send`](https://doc.rust-lang.org/std/marker/trait.Send.html) trait, which is necessary for it to be "sent across" a thread boundary (that is, moved to or accessed from a thread in which it wasn't originally instantiated). You'll notice right in the documentation of the trait it offers `Rc` as a type that specifically _isn't_ `Send` (and why).
+[^unsend]: In case you _aren't_ familiar with this particular jargonic morsel, `!Send` means that the type in question doesn't implement the [`std::marker::Send`](https://doc.rust-lang.org/std/marker/trait.Send.html) trait, which is necessary for it to be "sent across" a thread boundary (that is, moved to or accessed from a thread in which it wasn't originally instantiated). You'll notice right in the documentation of the trait it offers `Rc` as a type that specifically _isn't_ `Send` (and why).
+
+There are a couple of things we could do here. An obvious one is to just use [`std::sync::Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) instead of `Rc`. This would probably work, but it just seems like something we shouldn't have to do; nowhere is our program going to try to change the same reference count simultaneously from multiple threads.^[arc_perf]
+
+[^arc_perf]: There is also evidently a _slight_ performance penalty to using `Arc` where `Rc` would suffice, but worrying about this particular detail is laughable here.
+
+Fortunately, Tokio gives us a way to explicitly do what we want to do: [`tokio::task::LocalSet`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html). This is a way to explicitly ensure thread-local task-driving, specifically for this purpose. It's also, fortunately, convenient for us.

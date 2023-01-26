@@ -8,6 +8,7 @@ The [full spec is here.](https://protohackers.com/problem/3)
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc},
+    task,
 };
 
 mod client;
@@ -34,7 +35,10 @@ async fn main() {
     // so we don't even need to keep this one around.
     let (msg_tx, _) = broadcast::channel(MESSAGE_CAPACITY);
     let room = Room::new(evt_rx, msg_tx.clone());
-    tokio::spawn(async move {
+
+    let locals = task::LocalSet::new();
+
+    locals.spawn_local(async move {
         if let Err(e) = room.run().await {
             // This can't happen, because our `Room::run()` ended up only
             // ever returning `OK(())`, if it even returns.
@@ -46,23 +50,28 @@ async fn main() {
     log::info!("Bound to {}", LOCAL_ADDR);
     let mut client_n: usize = 0;
 
-    loop {
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                log::debug!("Rec'd connection {} from {:?}", client_n, &addr);
+    locals.spawn_local(async move {
+        loop {
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    log::debug!("Rec'd connection {} from {:?}", client_n, &addr);
 
-                let client = Client::new(
-                    client_n, socket, msg_tx.subscribe(), evt_tx.clone()
-                );
-                tokio::spawn(async move {
-                    client.start().await
-                });
-                
-                client_n += 1;
-            },
-            Err(e) => {
-                log::error!("Error with incoming connection: {}", &e);
+                    let client = Client::new(
+                        client_n, socket, msg_tx.subscribe(), evt_tx.clone()
+                    );
+                    log::debug!("Client {} created.", client_n);
+                    task::spawn_local(async move {
+                        client.start().await
+                    });
+                    
+                    client_n += 1;
+                },
+                Err(e) => {
+                    log::error!("Error with incoming connection: {}", &e);
+                }
             }
         }
-    }
+    });
+
+    locals.await;
 }

@@ -417,11 +417,9 @@ async fn main() {
 }
 ```
 
-The default `#[tokio::main]` macro invokes the default Tokio runtime, which will spawn threads and swap tasks between them as it sees fit to try to work as efficiently as possible. The `current_thread` flavor attempts to spawn all tasks and do all the work on the thread in which the runtime was created.[^unsend][^threads] I will almost always reach for this one because I am targeting my single-core VPS, which can only run one thread at a time, anyway.
+The default `#[tokio::main]` macro invokes the default Tokio runtime, which will spawn threads and swap tasks between them as it sees fit to try to work as efficiently as possible. The `current_thread` flavor attempts to spawn all tasks and do all the work on the thread in which the runtime was created.[^threads] I will almost always reach for this one because I am targeting my single-core VPS, which can only run one thread at a time, anyway.
 
-[^unsend]: Because it uses only one thread, this runtime can also spawn tasks that do not implement [`Send`](https://doc.rust-lang.org/std/marker/trait.Send.html), but that's way beyond scope here.
-
-[^threads]: The `current_thread` runtime actually will spawn additional threads for operations that block at the OS level; it just won't spawn new threads to run async tasks. This detail is also kind of beyond scope.
+[^threads]: The `current_thread` runtime actually will spawn additional threads for operations that block at the OS level; it just won't spawn new threads to run async tasks. This detail is kind of beyond our scope here.
 
 To motivate the second modification, I draw your attention to this section of the log output:
 
