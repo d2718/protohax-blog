@@ -236,12 +236,12 @@ impl Client {
         use tokio::sync::broadcast::error::RecvError;
         log::debug!("Client {} is running.", self.id);
 
-        let name = self.get_name()?;
-        let joinevt = Event::Join( self.id, name );
+        let name = self.get_name().await?;
+        log::debug!("Client {} is {}", self.id, &name);
+        let joinevt = Event::Join{ id: self.id, name };
         self.to_room.send(joinevt).await.map_err(|e| format!(
             "error sending Join event: {}", &e
         ))?;
-
 
         let mut line_buff: String = String::new();
 
@@ -404,18 +404,19 @@ impl Room {
     // Generate a list of names of clients currently connected.
     fn also_here(&self) -> String {
         if self.clients.is_empty() {
-            return "No one else is here.".into();
+            return "* No one else is here.\n".into();
         }
 
         let mut name_iter = self.clients.iter();
         // This is safe because `clients` has at least 1 member.
         let (_, name) = name_iter.next().unwrap();
-        let mut names = format!("Also here: {}", name);
+        let mut names = format!("* Also here: {}", name);
 
         for (_, name) in name_iter {
             names.push_str(", ");
             names.push_str(name.as_str())
         }
+        names.push('\n');
 
         names
     }
@@ -456,6 +457,7 @@ impl Room {
                     // It should be clear why this unwrap() will succeed.
                     let name = self.clients.get(&id).unwrap();
                     let msg = Rc::new(Message::One{ id, text });
+                    log::debug!("Room sending {:?}", &msg);
                     // This might return an error, but we don't care.
                     // See the `.send()` at the end of this while let loop.
                     let _ = self.to_clients.send(msg);
@@ -606,3 +608,140 @@ There are a couple of things we could do here. An obvious one is to just use [`s
 [^arc_perf]: There is also evidently a _slight_ performance penalty to using `Arc` where `Rc` would suffice, but worrying about this particular detail is laughable here.
 
 Fortunately, Tokio gives us a way to explicitly do what we want to do: [`tokio::task::LocalSet`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html). This is a way to explicitly ensure thread-local task-driving, specifically for this purpose. It's also, fortunately, convenient for us.
+
+There are several ways to use the `LocalSet`; we'll use it by pushing the futures we want to run onto it using [`LocalSet::spawn_local()`](https://docs.rs/tokio/latest/tokio/task/struct.LocalSet.html#method.spawn_local), and then we'll `.await` it to drive them. We'll start with `.run()`ning the `Room`:
+
+```rust
+    let locals = task::LocalSet::new();
+
+    locals.spawn_local(async move {
+        if let Err(e) = room.run().await {
+            // This can't happen, because our `Room::run()` ended up only
+            // ever returning `OK(())`, if it even returns.
+            log::error!("Error running Room: {}", &e);
+        }
+    });
+```
+
+This adds the supplied future to our set of local tasks, but it won't be run until we "start" the `LocalSet` by `.await`ing it. Because we want our connection-accepting loop to run concurrently with our `Room` (and the `Client`s we accept), we need to add it to our set as well; we wrap it in an `async` block and pass it to `.spawn_local()` just like above.
+
+```rust
+    let listener = TcpListener::bind(LOCAL_ADDR).await.unwrap();
+    log::info!("Bound to {}", LOCAL_ADDR);
+    let mut client_n: usize = 0;
+
+    locals.spawn_local(async move {
+        loop {
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    log::debug!("Rec'd connection {} from {:?}", client_n, &addr);
+
+                    let client = Client::new(
+                        client_n, socket, msg_tx.subscribe(), evt_tx.clone()
+                    );
+                    log::debug!("Client {} created.", client_n);
+                    // This `spawn_local()` is a separate _function_, not the
+                    // `LocalSet` method of the same name. It ensures that
+                    // this future is run on the same thread as the current
+                    // `LocalSet` task.
+                    tokio::task::spawn_local(async move {
+                        client.start().await
+                    });
+                    
+                    client_n += 1;
+                },
+                Err(e) => {
+                    log::error!("Error with incoming connection: {}", &e);
+                }
+            }
+        }
+    });
+```
+
+Notice the way we spawn our `Client` tasks has changed from `tokio::spawn()` to `tokio::task::spawn_local()`. This ensures that each of these tasks will also run on the same thread as the task that is spawning them. And finally, at the very end of `main()`, we `.await` the whole thing:
+
+```rust
+    locals.await;
+```
+
+And the Protohackers test log shows:
+
+```
+[Thu Jan 26 03:40:33 2023 UTC] [1client.test] NOTE:check starts
+[Thu Jan 26 03:40:33 2023 UTC] [1client.test] NOTE:connected to 104.168.201.111 port 12321
+[Thu Jan 26 03:40:37 2023 UTC] [1client.test] PASS
+[Thu Jan 26 03:40:38 2023 UTC] [2clients.test] NOTE:check starts
+[Thu Jan 26 03:40:38 2023 UTC] [2clients.test] NOTE:watchman connected to 104.168.201.111 port 12321
+[Thu Jan 26 03:40:38 2023 UTC] [2clients.test] NOTE:watchman joined the chat room
+[Thu Jan 26 03:40:38 2023 UTC] [2clients.test] NOTE:alice connected to 104.168.201.111 port 12321
+[Thu Jan 26 03:40:38 2023 UTC] [2clients.test] NOTE:bob connected to 104.168.201.111 port 12321
+[Thu Jan 26 03:40:39 2023 UTC] [2clients.test] NOTE:alice joined the chat room
+[Thu Jan 26 03:40:39 2023 UTC] [2clients.test] NOTE:bob joined the chat room
+[Thu Jan 26 03:40:39 2023 UTC] [2clients.test] FAIL:room membership message did not include 'watchman': * alice joins.
+```
+
+## A Race Condition, Sort Of
+
+```
+$ RUST_LOG=debug ./chat
+[2023-01-26T04:19:12Z INFO  chat] Bound to 0.0.0.0:12321
+[2023-01-26T04:19:12Z DEBUG chat::room] Room is running.
+[2023-01-26T04:19:16Z DEBUG chat] Rec'd connection 0 from 206.189.113.124:53644
+[2023-01-26T04:19:16Z DEBUG chat] Client 0 created.
+[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 started.
+[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 is running.
+[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 is MadCoder627
+[2023-01-26T04:19:16Z DEBUG chat::room] Room sending One { id: 0, text: "* No one else is here.\n" }
+[2023-01-26T04:19:16Z DEBUG chat::room] Room sending All { id: 0, text: "* MadCoder627 joins.\n" }
+[2023-01-26T04:19:16Z DEBUG chat::room]     reached 1 clients.
+[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 rec'd 32 bytes: good calculator party hypnotic
+
+[2023-01-26T04:19:16Z DEBUG chat::room] Room sending All { id: 0, text: "[MadCoder627] good calculator party hypnotic \n" }
+[2023-01-26T04:19:16Z DEBUG chat::room]     reached 1 clients.
+[2023-01-26T04:19:19Z DEBUG chat::client] Client 0 read 0 bytes; closing connection.
+[2023-01-26T04:19:19Z DEBUG chat::client] Client 0 disconnects.
+[2023-01-26T04:19:19Z DEBUG chat::room] Room sending All { id: 0, text: "* MadCoder627 leaves.\n" }
+[2023-01-26T04:19:19Z DEBUG chat::room]     no subscribed clients.
+[2023-01-26T04:19:20Z DEBUG chat] Rec'd connection 1 from 206.189.113.124:38038
+[2023-01-26T04:19:20Z DEBUG chat] Client 1 created.
+[2023-01-26T04:19:20Z DEBUG chat::client] Client 1 started.
+[2023-01-26T04:19:20Z DEBUG chat::client] Client 1 is running.
+[2023-01-26T04:19:20Z DEBUG chat::client] Client 1 is watchman
+[2023-01-26T04:19:20Z DEBUG chat::room] Room sending One { id: 1, text: "* No one else is here.\n" }
+[2023-01-26T04:19:20Z DEBUG chat::room] Room sending All { id: 1, text: "* watchman joins.\n" }
+[2023-01-26T04:19:20Z DEBUG chat::room]     reached 1 clients.
+[2023-01-26T04:19:21Z DEBUG chat] Rec'd connection 2 from 206.189.113.124:38040
+[2023-01-26T04:19:21Z DEBUG chat] Client 2 created.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 started.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 is running.
+[2023-01-26T04:19:21Z DEBUG chat] Rec'd connection 3 from 206.189.113.124:38042
+[2023-01-26T04:19:21Z DEBUG chat] Client 3 created.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 3 started.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 3 is running.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 is alice
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending One { id: 2, text: "* Also here: watchman\n" }
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "* alice joins.\n" }
+[2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 rec'd 22 bytes: I think I'm alone now
+
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "[alice] I think I'm alone now\n" }
+[2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 3 is bob
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending One { id: 3, text: "* Also here: watchman, alice\n" }
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 3, text: "* bob joins.\n" }
+[2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
+[2023-01-26T04:19:22Z ERROR chat::client] Client 1: read error: Connection reset by peer (os error 104)
+[2023-01-26T04:19:22Z ERROR chat::client] Client 1: error shutting down connection: Socket not connected (os error 107)
+[2023-01-26T04:19:22Z DEBUG chat::client] Client 1 disconnects.
+[2023-01-26T04:19:22Z DEBUG chat::room] Room sending All { id: 1, text: "* watchman leaves.\n" }
+[2023-01-26T04:19:22Z DEBUG chat::room]     reached 2 clients.
+[2023-01-26T04:19:22Z DEBUG chat::client] Client 3 read 0 bytes; closing connection.
+[2023-01-26T04:19:22Z DEBUG chat::client] Client 3 disconnects.
+[2023-01-26T04:19:22Z ERROR chat::client] Client 2: read error: Connection reset by peer (os error 104)
+[2023-01-26T04:19:22Z ERROR chat::client] Client 2: error shutting down connection: Socket not connected (os error 107)
+[2023-01-26T04:19:22Z DEBUG chat::client] Client 2 disconnects.
+[2023-01-26T04:19:22Z DEBUG chat::room] Room sending All { id: 3, text: "* bob leaves.\n" }
+[2023-01-26T04:19:22Z DEBUG chat::room]     no subscribed clients.
+[2023-01-26T04:19:22Z DEBUG chat::room] Room sending All { id: 2, text: "* alice leaves.\n" }
+[2023-01-26T04:19:22Z DEBUG chat::room]     no subscribed clients.
+```

@@ -32,13 +32,13 @@ impl Room {
     // Generate a list of names of clients currently connected.
     fn also_here(&self) -> String {
         if self.clients.is_empty() {
-            return "No one else is here.".into();
+            return "* No one else is here.\n".into();
         }
 
         let mut name_iter = self.clients.iter();
         // This is safe because `clients` has at least 1 member.
         let (_, name) = name_iter.next().unwrap();
-        let mut names = format!("Also here: {}", name);
+        let mut names = format!("* Also here: {}", name);
 
         for (_, name) in name_iter {
             names.push_str(", ");
@@ -67,6 +67,7 @@ impl Room {
                     // It should be clear why this unwrap() will succeed.
                     let name = self.clients.get(&id).unwrap();
                     let msg = Rc::new(Message::One{ id, text });
+                    log::debug!("Room sending {:?}", &msg);
                     // This might return an error, but we don't care.
                     // See the `.send()` at the end of this while let loop.
                     let _ = self.to_clients.send(msg);

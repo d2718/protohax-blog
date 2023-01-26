@@ -8,7 +8,6 @@ The [full spec is here.](https://protohackers.com/problem/3)
 use tokio::{
     net::TcpListener,
     sync::{broadcast, mpsc},
-    task,
 };
 
 mod client;
@@ -36,7 +35,7 @@ async fn main() {
     let (msg_tx, _) = broadcast::channel(MESSAGE_CAPACITY);
     let room = Room::new(evt_rx, msg_tx.clone());
 
-    let locals = task::LocalSet::new();
+    let locals = tokio::task::LocalSet::new();
 
     locals.spawn_local(async move {
         if let Err(e) = room.run().await {
@@ -60,7 +59,11 @@ async fn main() {
                         client_n, socket, msg_tx.subscribe(), evt_tx.clone()
                     );
                     log::debug!("Client {} created.", client_n);
-                    task::spawn_local(async move {
+                    // This `spawn_local()` is a separate _function_, not the
+                    // `LocalSet` method of the same name. It ensures that
+                    // this future is run on the same thread as the current
+                    // `LocalSet` task.
+                    tokio::task::spawn_local(async move {
                         client.start().await
                     });
                     
