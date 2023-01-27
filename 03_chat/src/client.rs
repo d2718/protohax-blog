@@ -81,11 +81,11 @@ impl Client {
             "error sending Join event: {}", &e
         ))?;
 
-        let mut line_buff: String = String::new();
+        let mut line_buff: Vec<u8> = Vec::new();
 
         loop {
             tokio::select!{
-                res = self.from_user.read_line(&mut line_buff) => match res {
+                res = self.from_user.read_until(b'\n', &mut line_buff) => match res {
                     Ok(0) => {
                         log::debug!(
                             "Client {} read 0 bytes; closing connection.",
@@ -94,23 +94,28 @@ impl Client {
                         return Ok(());
                     },
                     Ok(n) => {
-                        log::debug!(
-                            "Client {} rec'd {} bytes: {:?}",
-                            self.id, n, &line_buff
-                        );
                         // Every line has to end with '\n`. If we encountered
                         // EOF during this read, it might be missing.
-                        if !line_buff.ends_with('\n') {
-                            line_buff.push('\n');
+                        if !line_buff.ends_with(&[b'\n']) {
+                            line_buff.push(b'\n');
                         }
 
-                        let mut new_buff = String::new();
+                        let mut new_buff: Vec<u8> = Vec::new();
                         std::mem::swap(&mut line_buff, &mut new_buff);
                         // Now new_buff holds the line we just read, and
-                        // line_buff is a new empty string, ready to be read
+                        // line_buff is a new empty Vec, ready to be read
                         // into next time this branch completes.
 
-                        let evt = Event::Text{ id: self.id, text: new_buff };
+                        let line_str = String::from_utf8_lossy(&new_buff);
+
+                        // We'll move the log line down here to after we've
+                        // converted our line to a String.
+                        log::debug!(
+                            "Client {} rec'd {} bytes: {:?}",
+                            self.id, n, &line_str
+                        );
+
+                        let evt = Event::Text{ id: self.id, text: line_str.into() };
                         self.to_room.send(evt).await.map_err(|e| format!(
                             "unable to send event: {}", &e
                         ))?;

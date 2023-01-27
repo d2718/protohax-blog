@@ -423,6 +423,26 @@ impl Room {
 }
 ```
 
+Let's also write a method specifically for sending `Message`s down the broadcast channel. The channel will return an error if there are no listeners subscribed, but for us this isn't necessarily an erroneous situation; it may just mean that all the `Client`s have left by the time a message get sent, and this is fine. Nobody _should_ get that message. Handling this in its own function will make all the calling sites a little less noisy.
+
+```rust
+impl Room {
+
+    // Stuff from before goes here.
+
+    // Broadcast `msg` to all joined `Client`s, and deal with the non-error
+    // if there aren't any.
+    fn send(&self, msg: Message) {
+        log::debug!("Room sending {:?}", &msg);
+        match self.to_clients.send(Rc::new(msg)) {
+            Ok(n) => { log::debug!("    reached {} clients.", &n); },
+            Err(_) => { log::debug!("    no subscribed clients."); }
+        }
+    }
+}
+```
+
+
 Now we need to get our running logic down. This should be pretty straightforward; we're just going to `.recv()` `Event`s from our `mpsc::Reciever<Event>` and act accordingly:
 
   * If it's an `Event::Join`, we'll generate an "also_here" message, add the client name to the `self.clients` map, and send a "so and so joined" `Message`.
@@ -443,12 +463,12 @@ impl Room {
         log::debug!("Room is running.");
 
         while let Some(evt) = self.from_clients.recv().await {
-            let msg = match evt {
+            match evt {
                 Event::Text{ id, text } => {
                     // The given `id` should definitely be in the clients map.
                     let name = self.clients.get(&id).unwrap();
                     let text = format!("[{}] {}", name, &text);
-                    Rc::new(Message::All{ id, text })
+                    self.send(Message::All{ id, text });
                 },
 
                 Event::Join{ id, name } => {
@@ -456,31 +476,18 @@ impl Room {
                     self.clients.insert(id, name);
                     // It should be clear why this unwrap() will succeed.
                     let name = self.clients.get(&id).unwrap();
-                    let msg = Rc::new(Message::One{ id, text });
-                    log::debug!("Room sending {:?}", &msg);
-                    // This might return an error, but we don't care.
-                    // See the `.send()` at the end of this while let loop.
-                    let _ = self.to_clients.send(msg);
+                    self.send(Message::One{ id, text });
 
                     let text = format!("* {} joins.\n", name);
-                    Rc::new(Message::All{ id, text })
+                    self.send(Message::All{ id, text });
                 },
 
                 Event::Leave{ id } => {
-                    let name = self.clients.remove(&id).unwrap();
-                    let text = format!("* {} leaves.\n", &name);
-                    Rc::new(Message::All{ id, text })
+                    if let Some(name) = self.clients.remove(&id) {
+                        let text = format!("* {} leaves.\n", &name);
+                        self.send(Message::All{ id, text });
+                    }
                 },
-            };
-
-            log::debug!("Room sending {:?}", &msg);
-            match self.to_clients.send(msg) {
-                Ok(n) => { log::debug!("    reached {} clients.", &n); },
-                // The call to `.send()` returns an error if there are no
-                // Receivers subscribed to it, but that isn't necessarily
-                // a problem here; it may just be that all the connected
-                // clients have left by the time this is being sent.
-                Err(_) => { log::debug!("    no subscribed clients."); }
             }
         }
 
@@ -705,8 +712,7 @@ $ RUST_LOG=debug ./chat
 [2023-01-26T04:19:21Z DEBUG chat::room] Room sending One { id: 2, text: "* Also here: watchman\n" }
 [2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "* alice joins.\n" }
 [2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
-[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 rec'd 22 bytes: I think I'm alone now
-
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 rec'd 22 bytes: "I think I'm alone now\n"
 [2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "[alice] I think I'm alone now\n" }
 [2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
 [2023-01-26T04:19:21Z DEBUG chat::client] Client 3 is bob
@@ -758,8 +764,7 @@ If you notice, it's the text of the message mentioned in the test log error mess
 
 ```
 [2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
-[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 rec'd 22 bytes: I think I'm alone now
-
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 rec'd 22 bytes: "I think I'm alone now\n"
 [2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "[alice] I think I'm alone now\n" }
 ```
 
@@ -821,7 +826,7 @@ And now we're golden, right?
 What is it this time? Let's look at our debug log:
 
 ```
-[2023-01-27T03:26:33Z DEBUG chat::client] Client 2 rec'd 12 bytes:  more thing
+[2023-01-27T03:26:33Z DEBUG chat::client] Client 2 rec'd 12 bytes: " more thing\n"
 
 [2023-01-27T03:26:33Z DEBUG chat::room] Room sending All { id: 2, text: "[alice]  more thing\n" }
 ```
@@ -835,9 +840,113 @@ Well, that just looks like a glitch; the network must have just dropped a few by
 Uh, our log:
 
 ```
-[2023-01-27T03:32:02Z DEBUG chat::client] Client 2 rec'd 12 bytes:  more thing
-
+[2023-01-27T03:32:02Z DEBUG chat::client] Client 2 rec'd 12 bytes: " more thing\n"
 [2023-01-27T03:32:02Z DEBUG chat::room] Room sending All { id: 2, text: "[alice]  more thing\n" }
 ```
 
 Um, hmm. The exact same problem. If we run it a few more times, the results are similar. The first chunk of `alice`'s line keeps getting swallowed.
+
+While this is just a contrived challenge we are meeting, I honestly had to sleep on this one.[^not_sleep] The problem is apparent in the log message
+
+[^not_sleep]: Technically, I correctly guessed the problem's source while lying awake in bed, but I didn't take another crack at it until I'd slept.
+
+```
+[2023-01-27T03:32:02Z DEBUG chat::client] Client 2 rec'd 12 bytes: " more thing\n"
+```
+
+Already, at this point, we've lost some bytes. Let's look at where this message is printed and what's going on right before then:
+
+From `src/client.rs`:
+
+```rust
+            tokio::select!{
+                res = self.from_user.read_line(&mut line_buff) => match res {
+                    Ok(0) => {
+                      -  log::debug!(
+                            "Client {} read 0 bytes; closing connection.",
+                            self.id
+                        );
+                        return Ok(());
+                    },
+                    Ok(n) => {
+                        log::debug!(
+                            "Client {} rec'd {} bytes: {:?}",
+                            self.id, n, &line_buff
+                        );
+```
+
+The problematic text has just been read into `line_buff` by `AsyncBufReadExt::read_line()`, so let's just have a look-see at [the documentation](https://docs.rs/tokio/latest/tokio/io/trait.AsyncBufReadExt.html#method.read_line). Ah hah! Observe the section labeled "[Cancel safety](https://docs.rs/tokio/latest/tokio/io/trait.AsyncBufReadExt.html#cancel-safety-1)", wherein we learn that this method is _not_ "cancellation safe".
+
+Recall that the `select!` macro essentially "matches" against futures; it runs the arm of whichever future completes first. This means it is running _all_ of futures, and only dealing with the results of running _one_ of them. The other futures are _cancelled_; they are just aborted wherever they are. Some futures, like receiving a value from a channel, are, from a task-preemption standpoint, essentially atomic.[^atomic] If they don't complete, nothing has happened; you either suck a value out of a channel, or it's still there. These are considered _cancellation safe_ because if they are cancelled without completing, the state of the program is essentially no different than if they had not run at all. However, a method like `.read_line()` may need to make several separate reads, and if it gets cancelled after one or more of them, the underlying reader will still have had some bytes sucked out of it, and the internal buffer will have been changed. This is why it is _not_ cancellation safe; it's impossible to guarantee that starting it and cancelling it has the safe effect as not running it at all.
+
+[^atomic]: I intend the term "atomic" to be by analogy to the more common use of the term, but please don't confuse them; the set of operations that cannot be interrupted by the _task_ scheduler is much larger than the set of operations that cannot be interrupted by the _thread_ scheduler.
+
+Okay, so what do we do about this? Well, the documentation helpfully gives us some suggestions.[^suggestions]
+
+  * We can use [`.read_until()`](https://docs.rs/tokio/latest/tokio/io/trait.AsyncBufReadExt.html#method.read_until). This is essentially the same as `.read_line()`, but it puts data in a byte vector instead of a `String`. (It's also, and this is key, cancellation safe.)
+  * We can use `.lines()`, which gives us a [struct](https://docs.rs/tokio/latest/tokio/io/struct.Lines.html) that's essentially an `async` iterator that yields lines via the `.next_line()` method.
+  * We can use something from the [`tokio_util::codec`](https://docs.rs/tokio-util/latest/tokio_util/codec/index.html) module, which sounds complicated.
+
+[^suggestions]: You hear a lot of noise about zero-cost abstractions and memory safety, but this kind of thing is also a huge driver of Rust fanboyism.
+
+Let's just go with that first one. It seems like it's going to require the least rewriting. We'll just change our `line_buff` variable in `Client::run()` from a `String` to a `Vec<u8>` and add a conversion to a `String` before we stick the received line of text into our `Event::Text`. We have several choices about how exactly to make this conversion. The lines we receive are supposed to be just ASCII, so this should mean essentially just the compiler changing how it thinks about our pointer; our choices then really only differ in the way they deal with data that's outside the spec. I am going to choose [`String::from_utf8_lossy()`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_lossy), because that's the most convenient; it'll just silently mangle non-UTF-8 data, as opposed to forcing me to deal with an error ([`String::from_utf8()`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8)) or `unsafe` and possibly undefined behavior ([`String::from_utf8_unchecked()`](https://doc.rust-lang.org/std/string/struct.String.html#method.from_utf8_unchecked)).
+
+```rust
+        let mut line_buff: String = String::new();
+```
+
+becomes
+
+```rust
+        let mut line_buff: Vec<u8> = Vec::new();
+```
+
+and what was the `.read_line()` arm of our `select!` becomes
+
+```rust
+                res = self.from_user.read_until(b'\n', &mut line_buff) => match res {
+                    Ok(0) => {
+                        log::debug!(
+                            "Client {} read 0 bytes; closing connection.",
+                            self.id
+                        );
+                        return Ok(());
+                    },
+                    Ok(n) => {
+                        // Every line has to end with '\n`. If we encountered
+                        // EOF during this read, it might be missing.
+                        if !line_buff.ends_with(&[b'\n']) {
+                            line_buff.push(b'\n');
+                        }
+
+                        let mut new_buff: Vec<u8> = Vec::new();
+                        std::mem::swap(&mut line_buff, &mut new_buff);
+                        // Now new_buff holds the line we just read, and
+                        // line_buff is a new empty Vec, ready to be read
+                        // into next time this branch completes.
+
+                        let line_str = String::from_utf8_lossy(&new_buff);
+
+                        // We'll move the log line down here to after we've
+                        // converted our line to a String.
+                        log::debug!(
+                            "Client {} rec'd {} bytes: {:?}",
+                            self.id, n, &line_str
+                        );
+
+                        let evt = Event::Text{ id: self.id, text: line_str.into() };
+                        self.to_room.send(evt).await.map_err(|e| format!(
+                            "unable to send event: {}", &e
+                        ))?;
+                    },
+                    Err(e) => {
+                        return Err(format!("read error: {}", &e));
+                    }
+                },
+```
+
+This works.
+
+The one thing that bothers me about our implementation is the fact that room membership messages (the ones sent to newly-joined clients) get sent down the broadcast channel to _all_ clients, and then have to be ignored by everyone except the newly-joined client. Instead of a broadcast channel, we could have each client reading from its own `mpsc` channel. The `BTreeMap` that stores client names could also store the `Sender` end of each channel, then each `Message` could be individually sent to each `Client` who needs it. This requires a little more complexity in the `Room`'s running logic, and explicitly iterating through the map of (name, channel)s for each and every `Message` sent.
+
+Instead, let's change our `Event::Join` variant to hold the `Sender` end of a [`oneshot`](https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html) channel which can be used to return the room membership message to the `Client` and then forgotten about. This also has the advantage of simplifying our `Message` type, because room membership is the only thing communicated via the `Message::One` variant. This will require some surgery in a lot of places, but will ultimately make our design a little simpler.

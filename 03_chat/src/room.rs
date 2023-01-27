@@ -49,16 +49,26 @@ impl Room {
         names
     }
 
+    // Broadcast `msg` to all joined `Client`s, and deal with the non-error
+    // if there aren't any.
+    fn send(&self, msg: Message) {
+        log::debug!("Room sending {:?}", &msg);
+        match self.to_clients.send(Rc::new(msg)) {
+            Ok(n) => { log::debug!("    reached {} clients.", &n); },
+            Err(_) => { log::debug!("    no subscribed clients."); }
+        }
+    }
+
     pub async fn run(mut self) -> Result<(), String> {
         log::debug!("Room is running.");
 
         while let Some(evt) = self.from_clients.recv().await {
-            let msg = match evt {
+            match evt {
                 Event::Text{ id, text } => {
                     // The given `id` should definitely be in the clients map.
                     let name = self.clients.get(&id).unwrap();
                     let text = format!("[{}] {}", name, &text);
-                    Rc::new(Message::All{ id, text })
+                    self.send(Message::All{ id, text });
                 },
 
                 Event::Join{ id, name } => {
@@ -66,31 +76,18 @@ impl Room {
                     self.clients.insert(id, name);
                     // It should be clear why this unwrap() will succeed.
                     let name = self.clients.get(&id).unwrap();
-                    let msg = Rc::new(Message::One{ id, text });
-                    log::debug!("Room sending {:?}", &msg);
-                    // This might return an error, but we don't care.
-                    // See the `.send()` at the end of this while let loop.
-                    let _ = self.to_clients.send(msg);
+                    self.send(Message::One{ id, text });
 
                     let text = format!("* {} joins.\n", name);
-                    Rc::new(Message::All{ id, text })
+                    self.send(Message::All{ id, text });
                 },
 
                 Event::Leave{ id } => {
-                    let name = self.clients.remove(&id).unwrap();
-                    let text = format!("* {} leaves.\n", &name);
-                    Rc::new(Message::All{ id, text })
+                    if let Some(name) = self.clients.remove(&id) {
+                        let text = format!("* {} leaves.\n", &name);
+                        self.send(Message::All{ id, text });
+                    }
                 },
-            };
-
-            log::debug!("Room sending {:?}", &msg);
-            match self.to_clients.send(msg) {
-                Ok(n) => { log::debug!("    reached {} clients.", &n); },
-                // The call to `.send()` returns an error if there are no
-                // Receivers subscribed to it, but that isn't necessarily
-                // a problem here; it may just be that all the connected
-                // clients have left by the time this is being sent.
-                Err(_) => { log::debug!("    no subscribed clients."); }
             }
         }
 
