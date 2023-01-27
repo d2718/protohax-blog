@@ -599,11 +599,11 @@ note: required by a bound in `tokio::spawn`
 
 It goes on. This is just the first of several similar compiler admonitions.
 
-We knew those `Rc`s we wrapped around our `Message`s in order to save a lot of `String` cloning were `!Send`. (We knew all that, right?[^unsend]) But I guess we also assumed that the `current_thread` runtime would just automatically allow us to run un`Send`able futures. Obviously this is not the case.
+We knew those `Rc`s we wrapped around our `Message`s in order to save a lot of `String` cloning were `!Send`. (We all knew that, right?[^unsend]) But I guess we also assumed that the `current_thread` runtime would just automatically allow us to run un`Send`able futures. Obviously this is not the case.
 
 [^unsend]: In case you _aren't_ familiar with this particular jargonic morsel, `!Send` means that the type in question doesn't implement the [`std::marker::Send`](https://doc.rust-lang.org/std/marker/trait.Send.html) trait, which is necessary for it to be "sent across" a thread boundary (that is, moved to or accessed from a thread in which it wasn't originally instantiated). You'll notice right in the documentation of the trait it offers `Rc` as a type that specifically _isn't_ `Send` (and why).
 
-There are a couple of things we could do here. An obvious one is to just use [`std::sync::Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) instead of `Rc`. This would probably work, but it just seems like something we shouldn't have to do; nowhere is our program going to try to change the same reference count simultaneously from multiple threads.^[arc_perf]
+There are a couple of things we could do here. An obvious one is to just use [`std::sync::Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) instead of `Rc`. This would probably work, but it just seems like something we shouldn't have to do; nowhere is our program going to try to change the same reference count simultaneously from multiple threads.[^arc_perf]
 
 [^arc_perf]: There is also evidently a _slight_ performance penalty to using `Arc` where `Rc` would suffice, but worrying about this particular detail is laughable here.
 
@@ -682,38 +682,21 @@ And the Protohackers test log shows:
 
 ## A Race Condition, Sort Of
 
+What? That's not even a room membership message? What's going on here? And I thought Rust couldn't have race conditions, what with ownership and the borrow checker and all.[^cool_bear]
+
+[^cool_bear]: I really need [Amos](https://fasterthanli.me)'s Cool Bear as a foil here.
+
+Well, if you're really determined, not even Rust can save you from every hazard you[^you] insist on blundering into. This isn't a race condition because stuff is nondeterministically executing out of the order in which we need it to; we[^we] literally just wrote it out of order. Let's look at this debug log and see if we can figure it out.
+
+[^you]: And through use of the "impersonal you" here, I most definitely mean "me".
+
+[^we]: Me, again.
+
 ```
 $ RUST_LOG=debug ./chat
-[2023-01-26T04:19:12Z INFO  chat] Bound to 0.0.0.0:12321
-[2023-01-26T04:19:12Z DEBUG chat::room] Room is running.
-[2023-01-26T04:19:16Z DEBUG chat] Rec'd connection 0 from 206.189.113.124:53644
-[2023-01-26T04:19:16Z DEBUG chat] Client 0 created.
-[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 started.
-[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 is running.
-[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 is MadCoder627
-[2023-01-26T04:19:16Z DEBUG chat::room] Room sending One { id: 0, text: "* No one else is here.\n" }
-[2023-01-26T04:19:16Z DEBUG chat::room] Room sending All { id: 0, text: "* MadCoder627 joins.\n" }
-[2023-01-26T04:19:16Z DEBUG chat::room]     reached 1 clients.
-[2023-01-26T04:19:16Z DEBUG chat::client] Client 0 rec'd 32 bytes: good calculator party hypnotic
 
-[2023-01-26T04:19:16Z DEBUG chat::room] Room sending All { id: 0, text: "[MadCoder627] good calculator party hypnotic \n" }
-[2023-01-26T04:19:16Z DEBUG chat::room]     reached 1 clients.
-[2023-01-26T04:19:19Z DEBUG chat::client] Client 0 read 0 bytes; closing connection.
-[2023-01-26T04:19:19Z DEBUG chat::client] Client 0 disconnects.
-[2023-01-26T04:19:19Z DEBUG chat::room] Room sending All { id: 0, text: "* MadCoder627 leaves.\n" }
-[2023-01-26T04:19:19Z DEBUG chat::room]     no subscribed clients.
-[2023-01-26T04:19:20Z DEBUG chat] Rec'd connection 1 from 206.189.113.124:38038
-[2023-01-26T04:19:20Z DEBUG chat] Client 1 created.
-[2023-01-26T04:19:20Z DEBUG chat::client] Client 1 started.
-[2023-01-26T04:19:20Z DEBUG chat::client] Client 1 is running.
-[2023-01-26T04:19:20Z DEBUG chat::client] Client 1 is watchman
-[2023-01-26T04:19:20Z DEBUG chat::room] Room sending One { id: 1, text: "* No one else is here.\n" }
-[2023-01-26T04:19:20Z DEBUG chat::room] Room sending All { id: 1, text: "* watchman joins.\n" }
-[2023-01-26T04:19:20Z DEBUG chat::room]     reached 1 clients.
-[2023-01-26T04:19:21Z DEBUG chat] Rec'd connection 2 from 206.189.113.124:38040
-[2023-01-26T04:19:21Z DEBUG chat] Client 2 created.
-[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 started.
-[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 is running.
+# ... skipping to the relevant part
+
 [2023-01-26T04:19:21Z DEBUG chat] Rec'd connection 3 from 206.189.113.124:38042
 [2023-01-26T04:19:21Z DEBUG chat] Client 3 created.
 [2023-01-26T04:19:21Z DEBUG chat::client] Client 3 started.
@@ -729,19 +712,132 @@ $ RUST_LOG=debug ./chat
 [2023-01-26T04:19:21Z DEBUG chat::client] Client 3 is bob
 [2023-01-26T04:19:21Z DEBUG chat::room] Room sending One { id: 3, text: "* Also here: watchman, alice\n" }
 [2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 3, text: "* bob joins.\n" }
-[2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
-[2023-01-26T04:19:22Z ERROR chat::client] Client 1: read error: Connection reset by peer (os error 104)
-[2023-01-26T04:19:22Z ERROR chat::client] Client 1: error shutting down connection: Socket not connected (os error 107)
-[2023-01-26T04:19:22Z DEBUG chat::client] Client 1 disconnects.
-[2023-01-26T04:19:22Z DEBUG chat::room] Room sending All { id: 1, text: "* watchman leaves.\n" }
-[2023-01-26T04:19:22Z DEBUG chat::room]     reached 2 clients.
-[2023-01-26T04:19:22Z DEBUG chat::client] Client 3 read 0 bytes; closing connection.
-[2023-01-26T04:19:22Z DEBUG chat::client] Client 3 disconnects.
-[2023-01-26T04:19:22Z ERROR chat::client] Client 2: read error: Connection reset by peer (os error 104)
-[2023-01-26T04:19:22Z ERROR chat::client] Client 2: error shutting down connection: Socket not connected (os error 107)
-[2023-01-26T04:19:22Z DEBUG chat::client] Client 2 disconnects.
-[2023-01-26T04:19:22Z DEBUG chat::room] Room sending All { id: 3, text: "* bob leaves.\n" }
-[2023-01-26T04:19:22Z DEBUG chat::room]     no subscribed clients.
-[2023-01-26T04:19:22Z DEBUG chat::room] Room sending All { id: 2, text: "* alice leaves.\n" }
-[2023-01-26T04:19:22Z DEBUG chat::room]     no subscribed clients.
+
+# Ignoring the rest ...
+
 ```
+
+There's the problem, right there. `bob` is seeing messages that he shouldn't. Let's go through that again.
+
+
+```
+[2023-01-26T04:19:21Z DEBUG chat] Rec'd connection 3 from 206.189.113.124:38042
+```
+
+At this point, `bob`'s connection has been accepted.
+
+```
+[2023-01-26T04:19:21Z DEBUG chat] Client 3 created.
+```
+
+Then immediately his `Client` is instantiated. This happens here in our `main()` function:
+
+```rust
+                    let client = Client::new(
+                        client_n, socket, msg_tx.subscribe(), evt_tx.clone()
+                    );
+                    log::debug!("Client {} created.", client_n);
+```
+
+You can even see where the log message is printed. The relevant detail is that this is the point where `bob`'s `Client` subscribes to the `broadcast` channel (`msg_tx.subscribe()`); every `Rc<Message>` that comes down that pipe after this line executes will get to `bob`. 
+
+```
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 3 started.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 3 is running.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 is alice
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending One { id: 2, text: "* Also here: watchman\n" }
+```
+
+Not that one, because that one only goes to `alice`, but this next one is the first once he receives:
+
+```
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "* alice joins.\n" }
+```
+
+If you notice, it's the text of the message mentioned in the test log error message.
+
+```
+[2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 2 rec'd 22 bytes: I think I'm alone now
+
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 2, text: "[alice] I think I'm alone now\n" }
+```
+
+He also sees this one.
+
+```
+[2023-01-26T04:19:21Z DEBUG chat::room]     reached 3 clients.
+[2023-01-26T04:19:21Z DEBUG chat::client] Client 3 is bob
+```
+But now _this_ is the point when `bob` joins the room. His name negotiation has completed, and his `Client` has sent the `Event::Join` up the `mpsc` to the `Room`.
+
+(The relevant portion from `src/client.rs` in the `Client::run()` method:)
+
+```rust
+        let name = self.get_name().await?;
+        let joinevt = Event::Join{ id: self.id, name };
+        self.to_room.send(joinevt).await.map_err(|e| format!(
+            "error sending Join event: {}", &e
+        ))?;
+```
+
+_This_ is the point at which `bob` should start getting `Messages`; this next message _should_ be the first one that he sees (the room membership message the test client expected):
+
+```
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending One { id: 3, text: "* Also here: watchman, alice\n" }
+[2023-01-26T04:19:21Z DEBUG chat::room] Room sending All { id: 3, text: "* bob joins.\n" }
+```
+
+So the problem is that there are several `.await`s between when a `Client` subscribes to the `broadcast` channel and when it should actually start receiving messages, so any messages that end up being shoved into the tube in that gap will trip us up.[^debug_speed]
+
+[^debug_speed]: I know you know this already, but I wanted to state it explicitly so I don't appear to be trying to misrepresent anything: The amount of time that passes between reading about my discovery of this problem and reading about my identification of the bug is much, much smaller than the amount of time that passed between those two events in real time as they were happening. And this is all to say nothing of the myriad smaller toe-stubs along the way like forgetting newlines at the ends of messages or just plain assigning to the wrong varaible.
+
+What can we do about this? Can we somehow defer the subscription to the channel until that moment? Can we replace the client's `from_room: Receiver<Rc<Message>>` with `from_room: Option<Receiver<Rc<Nessage>>>` and pass a reference to the `Sender` end of that channel to the `Client::start()` method, which passes it to the `Client::run()` method, which then subscribes to it right as the join event is being sent? Can we use something like [`task::unconstrained()`](https://docs.rs/tokio/latest/tokio/task/fn.unconstrained.html) to ensure we can suck all the messages out and drop them on the ground at that point without risking being preempted and having more put back in?
+
+Ah, hah! The `broadcast::Receiver` offers a [`.resubscribe()`](https://docs.rs/tokio/latest/tokio/sync/broadcast/struct.Receiver.html#method.resubscribe) method. This returns a new clone of the `Receiver` whose subscription begins at the moment of the method call; any messages already in the channel get dropped.[^dropped] The relevant stanza now becomes:
+
+[^dropped]: Dropped for this particular `Reciever`, at least; this has no effect on other subscribers.
+
+```rust
+        let name = self.get_name().await?;
+        let joinevt = Event::Join{ id: self.id, name };
+        // Ignore anything already in this channel.
+        self.from_room = self.from_room.resubscribe();
+        self.to_room.send(joinevt).await.map_err(|e| format!(
+            "error sending Join event: {}", &e
+        ))?;
+```
+
+And now we're golden, right?
+
+```
+# ... everything except the last line of the Protohackers test log skipped.
+
+[Fri Jan 27 03:26:33 2023 UTC] [2clients.test] FAIL:message to 'bob' was not correct (expected '[alice] Just one more thing'): [alice]  more thing
+```
+
+## `async` Cancellation
+
+What is it this time? Let's look at our debug log:
+
+```
+[2023-01-27T03:26:33Z DEBUG chat::client] Client 2 rec'd 12 bytes:  more thing
+
+[2023-01-27T03:26:33Z DEBUG chat::room] Room sending All { id: 2, text: "[alice]  more thing\n" }
+```
+
+Well, that just looks like a glitch; the network must have just dropped a few bytes somewhere. Let's run it again. Their log:
+
+```
+[Fri Jan 27 03:32:02 2023 UTC] [2clients.test] FAIL:message to 'watchman' was not correct (expected '[alice] Just one more thing'): [alice]  more thing
+```
+
+Uh, our log:
+
+```
+[2023-01-27T03:32:02Z DEBUG chat::client] Client 2 rec'd 12 bytes:  more thing
+
+[2023-01-27T03:32:02Z DEBUG chat::room] Room sending All { id: 2, text: "[alice]  more thing\n" }
+```
+
+Um, hmm. The exact same problem. If we run it a few more times, the results are similar. The first chunk of `alice`'s line keeps getting swallowed.

@@ -74,11 +74,9 @@ impl Client {
         log::debug!("Client {} is running.", self.id);
 
         let name = self.get_name().await?;
-        log::debug!("Client {} is {}", self.id, &name);
-
-        //self.from_room = self.from_room.resubscribe();
-
         let joinevt = Event::Join{ id: self.id, name };
+        // Ignore anything already in this channel.
+        self.from_room = self.from_room.resubscribe();
         self.to_room.send(joinevt).await.map_err(|e| format!(
             "error sending Join event: {}", &e
         ))?;
@@ -97,7 +95,7 @@ impl Client {
                     },
                     Ok(n) => {
                         log::debug!(
-                            "Client {} rec'd {} bytes: {}",
+                            "Client {} rec'd {} bytes: {:?}",
                             self.id, n, &line_buff
                         );
                         // Every line has to end with '\n`. If we encountered
