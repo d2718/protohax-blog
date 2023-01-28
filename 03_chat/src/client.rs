@@ -6,7 +6,7 @@ use std::rc::Rc;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
     net::TcpStream,
-    sync::{broadcast::Receiver, mpsc::Sender},
+    sync::{broadcast::Receiver, mpsc::Sender, oneshot},
 };
 
 use crate::message::{Event, Message};
@@ -74,11 +74,19 @@ impl Client {
         log::debug!("Client {} is running.", self.id);
 
         let name = self.get_name().await?;
-        let joinevt = Event::Join{ id: self.id, name };
+        let (membership, memb_recv) = oneshot::channel();
+        let joinevt = Event::Join{ id: self.id, name, membership };
         // Ignore anything already in this channel.
         self.from_room = self.from_room.resubscribe();
         self.to_room.send(joinevt).await.map_err(|e| format!(
             "error sending Join event: {}", &e
+        ))?;
+
+        let memb_msg = memb_recv.await.map_err(|e| format!(
+            "error receiving membership message: {}", &e
+        ))?;
+        self.to_user.write_all(memb_msg.as_bytes()).await.map_err(|e| format!(
+            "write error: {}", &e
         ))?;
 
         let mut line_buff: Vec<u8> = Vec::new();
@@ -126,26 +134,13 @@ impl Client {
                 },
 
                 res = self.from_room.recv() => match res {
-                    // We can't match directly on an `Rc`; we have to
-                    // dereference it to match "through" it; hence the
-                    // ugly nested match here.
-                    Ok(msg_ptr) => match *msg_ptr {
-                        Message::All{ id, ref text } => {
-                            if self.id != id {
-                                self.to_user.write_all(text.as_bytes()).await
-                                    .map_err(|e| format!(
-                                        "write error: {}", &e
-                                    ))?;
-                            }
-                        },
-                        Message::One{ id, ref text } => {
-                            if self.id == id {
-                                self.to_user.write_all(text.as_bytes()).await
-                                    .map_err(|e| format!(
-                                        "write error: {}", &e
-                                    ))?;
-                            }
-                        },
+                    Ok(msg_ptr) => {
+                        if msg_ptr.id != self.id {
+                            self.to_user.write_all(msg_ptr.text.as_bytes()).await
+                                .map_err(|e| format!(
+                                    "write error: {}", &e
+                                ))?;
+                        }
                     },
                     Err(RecvError::Lagged(n)) => {
                         log::warn!(

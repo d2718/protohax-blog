@@ -950,3 +950,179 @@ This works.
 The one thing that bothers me about our implementation is the fact that room membership messages (the ones sent to newly-joined clients) get sent down the broadcast channel to _all_ clients, and then have to be ignored by everyone except the newly-joined client. Instead of a broadcast channel, we could have each client reading from its own `mpsc` channel. The `BTreeMap` that stores client names could also store the `Sender` end of each channel, then each `Message` could be individually sent to each `Client` who needs it. This requires a little more complexity in the `Room`'s running logic, and explicitly iterating through the map of (name, channel)s for each and every `Message` sent.
 
 Instead, let's change our `Event::Join` variant to hold the `Sender` end of a [`oneshot`](https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html) channel which can be used to return the room membership message to the `Client` and then forgotten about. This also has the advantage of simplifying our `Message` type, because room membership is the only thing communicated via the `Message::One` variant. This will require some surgery in a lot of places, but will ultimately make our design a little simpler.
+
+*****
+
+Our new `src/message.rs`:
+
+```rust
+/*!
+Types to get passed through channels.
+*/
+use tokio::sync::oneshot;
+
+/// Chunks of information sent from a Client to the Room.
+#[derive(Clone, Debug)]
+pub enum Event {
+    Join{ id: usize, name: String, membership: oneshot::Sender<String> },
+    Leave{ id: usize },
+    Text{ id: usize, text: String },
+}
+
+/// Lines of text to be sent from the Room to the Clients.
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub id: usize,
+    pub text: String
+}
+```
+
+The `Message` type has gone from being an enum to just a struct, because there's only one type now. Dialog messages will each still have to be ignored by one `Client` (the one that sent the message), but I think that's okay.
+
+The new `Room::run()` method:
+
+```rust
+    pub async fn run(mut self) -> Result<(), String> {
+        log::debug!("Room is running.");
+
+        while let Some(evt) = self.from_clients.recv().await {
+            match evt {
+                Event::Text{ id, text } => {
+                    // The given `id` should definitely be in the clients map.
+                    let name = self.clients.get(&id).unwrap();
+                    let text = format!("[{}] {}", name, &text);
+                    self.send(Message{ id, text });
+                },
+
+                Event::Join{ id, name, membership } => {
+                    let text = self.also_here();
+                    self.clients.insert(id, name);
+                    if let Err(e) = membership.send(text) {
+                        log::error!(
+                            "Failed to send membership message to Client {}: {:?}",
+                            id, &e
+                        );
+                    }
+                    // It should be clear why this unwrap() will succeed.
+                    let name = self.clients.get(&id).unwrap();
+                    let text = format!("* {} joins.\n", name);
+                    self.send(Message{ id, text });
+                },
+
+                Event::Leave{ id } => {
+                    if let Some(name) = self.clients.remove(&id) {
+                        let text = format!("* {} leaves.\n", &name);
+                        self.send(Message{ id, text });
+                    }
+                },
+            }
+        }
+
+        Ok(())
+    }
+```
+
+And the new `Client::run()` method:
+
+```rust
+    async fn run(&mut self) -> Result<(), String> {
+        use tokio::sync::broadcast::error::RecvError;
+        log::debug!("Client {} is running.", self.id);
+
+        let name = self.get_name().await?;
+        let (membership, memb_recv) = oneshot::channel();
+        let joinevt = Event::Join{ id: self.id, name, membership };
+        // Ignore anything already in this channel.
+        self.from_room = self.from_room.resubscribe();
+        self.to_room.send(joinevt).await.map_err(|e| format!(
+            "error sending Join event: {}", &e
+        ))?;
+
+        let memb_msg = memb_recv.await.map_err(|e| format!(
+            "error receiving membership message: {}", &e
+        ))?;
+        self.to_user.write_all(memb_msg.as_bytes()).await.map_err(|e| format!(
+            "write error: {}", &e
+        ))?;
+
+        let mut line_buff: Vec<u8> = Vec::new();
+
+        loop {
+            tokio::select!{
+                res = self.from_user.read_until(b'\n', &mut line_buff) => match res {
+                    Ok(0) => {
+                        log::debug!(
+                            "Client {} read 0 bytes; closing connection.",
+                            self.id
+                        );
+                        return Ok(());
+                    },
+                    Ok(n) => {
+                        // Every line has to end with '\n`. If we encountered
+                        // EOF during this read, it might be missing.
+                        if !line_buff.ends_with(&[b'\n']) {
+                            line_buff.push(b'\n');
+                        }
+
+                        let mut new_buff: Vec<u8> = Vec::new();
+                        std::mem::swap(&mut line_buff, &mut new_buff);
+                        // Now new_buff holds the line we just read, and
+                        // line_buff is a new empty Vec, ready to be read
+                        // into next time this branch completes.
+
+                        let line_str = String::from_utf8_lossy(&new_buff);
+
+                        // We'll move the log line down here to after we've
+                        // converted our line to a String.
+                        log::debug!(
+                            "Client {} rec'd {} bytes: {:?}",
+                            self.id, n, &line_str
+                        );
+
+                        let evt = Event::Text{ id: self.id, text: line_str.into() };
+                        self.to_room.send(evt).await.map_err(|e| format!(
+                            "unable to send event: {}", &e
+                        ))?;
+                    },
+                    Err(e) => {
+                        return Err(format!("read error: {}", &e));
+                    }
+                },
+
+                res = self.from_room.recv() => match res {
+                    Ok(msg_ptr) => {
+                        if msg_ptr.id != self.id {
+                            self.to_user.write_all(msg_ptr.text.as_bytes()).await
+                                .map_err(|e| format!(
+                                    "write error: {}", &e
+                                ))?;
+                        }
+                    },
+                    Err(RecvError::Lagged(n)) => {
+                        log::warn!(
+                            "Client {} dropped {} Message(s)",
+                            self.id, n
+                        );
+                        let text = format!(
+                            "Your connection has lagged and dropped {} message(s).", n
+                        );
+                        self.to_user.write_all(text.as_bytes()).await
+                            .map_err(|e| format!(
+                                "write error: {}", &e
+                            ))?;
+                    }
+                    // We shouldn't ever encounter this error, but we have to
+                    // match exhaustively, and it's the only other kind of
+                    // RecvError.
+                    Err(RecvError::Closed) => {
+                        return Err("broadcast channel closed".into());
+                    },
+                }
+            }
+        }
+    }
+```
+
+And that's a wrap. It works; `Client::run()` is a little more complicated in one spot, but less complicated elsewhere, `Room::run()` is less complicated, and the `Message` type is simpler. If you want to see the full final forms of all involved files, there's [a GitHub repository](https://github.com/d2718/protohax-blog) of this entire series.
+
+I found [the next problem](https://protohackers.com/problem/4) to be much easier; the next post in this series will be much shorter. The server has to communicate with clients over UDP instead of TCP; if this blog were actually about the implementation of these different protocols, this would make much more of a difference, but we're focused on the `async` aspect, and not really on the underlying transport layer, so there'll be essentially nothing new.

@@ -68,24 +68,28 @@ impl Room {
                     // The given `id` should definitely be in the clients map.
                     let name = self.clients.get(&id).unwrap();
                     let text = format!("[{}] {}", name, &text);
-                    self.send(Message::All{ id, text });
+                    self.send(Message{ id, text });
                 },
 
-                Event::Join{ id, name } => {
+                Event::Join{ id, name, membership } => {
                     let text = self.also_here();
                     self.clients.insert(id, name);
+                    if let Err(e) = membership.send(text) {
+                        log::error!(
+                            "Failed to send membership message to Client {}: {:?}",
+                            id, &e
+                        );
+                    }
                     // It should be clear why this unwrap() will succeed.
                     let name = self.clients.get(&id).unwrap();
-                    self.send(Message::One{ id, text });
-
                     let text = format!("* {} joins.\n", name);
-                    self.send(Message::All{ id, text });
+                    self.send(Message{ id, text });
                 },
 
                 Event::Leave{ id } => {
                     if let Some(name) = self.clients.remove(&id) {
                         let text = format!("* {} leaves.\n", &name);
-                        self.send(Message::All{ id, text });
+                        self.send(Message{ id, text });
                     }
                 },
             }
