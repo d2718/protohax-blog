@@ -449,9 +449,8 @@ Now we need to get our running logic down. This should be pretty straightforward
   * If it's an `Event::Leave`, we'll remove the client's entry in `self.clients` and send a "so and so left" `Message`.
   * If it's an `Event::Text`, we'll send the text as a `Message`.
 
-Normally if we encounter any errors, we'd bail, but there are only a couple of places where we might end up with an `Err` on our hands, and neither of them is really a problem, so we won't even bail.[^bail]
+The only place where we might end up with an `Err` on our hands is in the `.send()` method, and that's a non-issue we've already addressed.[^bail]
 
-[^bail]: Unless something `panic()`s, but we don't anticipate that, and in any case, that's more like "literally dying to escape this social situation" than it is "leaving the party early because we're just not feeling it".
 
 ```rust
 
@@ -947,11 +946,11 @@ and what was the `.read_line()` arm of our `select!` becomes
 
 This works.
 
+## Fine Tuning
+
 The one thing that bothers me about our implementation is the fact that room membership messages (the ones sent to newly-joined clients) get sent down the broadcast channel to _all_ clients, and then have to be ignored by everyone except the newly-joined client. Instead of a broadcast channel, we could have each client reading from its own `mpsc` channel. The `BTreeMap` that stores client names could also store the `Sender` end of each channel, then each `Message` could be individually sent to each `Client` who needs it. This requires a little more complexity in the `Room`'s running logic, and explicitly iterating through the map of (name, channel)s for each and every `Message` sent.
 
 Instead, let's change our `Event::Join` variant to hold the `Sender` end of a [`oneshot`](https://docs.rs/tokio/latest/tokio/sync/oneshot/index.html) channel which can be used to return the room membership message to the `Client` and then forgotten about. This also has the advantage of simplifying our `Message` type, because room membership is the only thing communicated via the `Message::One` variant. This will require some surgery in a lot of places, but will ultimately make our design a little simpler.
-
-*****
 
 Our new `src/message.rs`:
 
@@ -977,7 +976,9 @@ pub struct Message {
 }
 ```
 
-The `Message` type has gone from being an enum to just a struct, because there's only one type now. Dialog messages will each still have to be ignored by one `Client` (the one that sent the message), but I think that's okay.
+The `Message` type has gone from being an enum to just a struct, because there's only one type now. Dialog messages will each still have to be ignored by one `Client` (the one that sent the message), but I think that's okay.[^ignored_messages]
+
+[^ignored_messages]: Also, if I were designing this protocol, I'd prefer to have each user's message echoed back to them, so _nobody's_ messages would get ignored.
 
 The new `Room::run()` method:
 
