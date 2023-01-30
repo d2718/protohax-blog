@@ -1,6 +1,6 @@
 title: Protohackers in Rust, Part 04
 subtitle: Nothing new here
-time: 2023-01-22 20:54:00
+time: 2023-01-29 21:42:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the fourth Protohackers problem
 
@@ -35,7 +35,7 @@ Requests and responses must all be shorter than 1000 bytes.
 
 ## Easy, let's do it
 
-This problem doesn't even really warrant an asynchronous solution, but we're going to implement one anyway because that's what we're all about (at least for the duration of this series). Our server will run two tasks, one that reads/writes from/to our UDP socket, the other which does store/retrieve operations on our key--value store, which will just be a plain `HashMap<Vec<u8>, Vec<u8>>`. The two will communicate with a pair of [(`mpsc`) channels](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html). The socket task will push messages that each contain an request and a return address into one socket, the store task will process them and, when warranted, return response messages back to the socket task to be sent.
+This problem doesn't even really warrant an asynchronous solution, but we're going to implement one anyway because that's what we're all about (at least for the duration of this series). Our server will run two tasks, one that reads/writes from/to our UDP socket, the other which does store/retrieve operations on our key--value store, which will just be a plain `HashMap<Vec<u8>, Vec<u8>>`. The two will communicate with a pair of [(`mpsc`) channels](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html). The socket task will push messages that each contain a request and a return address into one socket, the store task will process them and, when warranted, return response messages back to the socket task to be sent. Having the store in its own task which only communicates through channels allows us to avoid worrying about locking; there's only ever one scope that reads from or writes to it.
 
 ```bash
 $ cargo new 04_udp --name udp
@@ -171,3 +171,99 @@ async fn manage_socket(
 }
 ```
 
+Now for the function to manage the store. It'll just listen for messages on one channel, and for each one it'll access the store (if warranted), and (if warranted) build and return a response through the other channel.
+
+```rust
+async fn manage_store(
+    to_socket: Sender<Msg>,
+    mut from_socket: Receiver<Msg>
+) {
+    log::debug!("manage_store() started.");
+
+    let mut store: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+
+    while let Some(msg) = from_socket.recv().await {
+        let request = &msg.bytes[..msg.length];
+
+        if request == b"version" {
+            let mut bytes = buffer();
+            (&mut bytes[..VERSION.len()]).clone_from_slice(&VERSION);
+            let msg = Msg {
+                bytes,
+                length: VERSION.len(),
+                addr: msg.addr
+            };
+
+            if let Err(e) = to_socket.send(msg).await {
+                log::error!("unable to send to socket task: {}", &e);
+            }
+            continue;
+        }
+
+        // If the request contains an '=', it's an insert.
+        if let Some(n) = request.iter().position(|&b| b == b'=') {
+            if &request[..n] == b"version" {
+                // Let this request hit the flooooooooor.
+                continue;
+            }
+
+            let key = Vec::from(&request[..n]);
+            let val = Vec::from(&request[(n+1)..]);
+
+            log::debug!(
+                "inserting {:?}={:?}",
+                &String::from_utf8_lossy(&key),
+                &String::from_utf8_lossy(&val)
+            );
+
+            store.insert(key, val);
+
+        // Otherwise, it's a retrieve.
+        } else {
+            if let Some(val) = store.get(request) {
+                // The extra byte in the length of the response is for the '='.
+                let length = val.len() + request.len() + 1;
+
+                // The slicing involved in copying the response data into the
+                // Buffer is a little tricky.
+                let mut bytes = buffer();
+                (&mut bytes[..request.len()]).clone_from_slice(request);
+                bytes[request.len()] = b'=';
+                (&mut bytes[(request.len()+1)..length]).clone_from_slice(val);
+
+                let msg = Msg {
+                    bytes, length,
+                    addr: msg.addr,
+                };
+
+                if let Err(e) = to_socket.send(msg).await {
+                    log::error!("unable to send to socket task: {}", &e);
+                }
+            }
+            // If our `store` doesn't contain a value associated with the
+            // requested key, we just ignore the request.
+        }
+    }
+}
+```
+
+And for the main function, we'll just create the two channels an pass the endpoints to our functions. We'll run our functions with the [`tokio::join!`](https://docs.rs/tokio/latest/tokio/macro.join.html) macro, which takes a list of futures and automatically awaits on driving them all to completion. (`join!` will also return a tuple of values, one for each future, but neither of our futures return anything---or even terminate and return at all, for that matter---so we don't care.)
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    env_logger::init();
+
+    let (to_store, from_socket) = channel(CHANSIZE);
+    let (to_socket, from_store) = channel(CHANSIZE);
+
+    tokio::join!(
+        manage_socket(to_store, from_store),
+        manage_store(to_socket, from_socket),
+    );
+}
+```
+
+That's it. This works, no debugging, no shaking our fists at the compiler; I told you it was going to be easy. Next time we have to write a mischevious[^mischevious] proxy for the chat server we implemented last time, and that will be mildly interesting; after that we're building an automated system for issuing traffic tickets, which will be a dramatic increase in complexity.
+
+[^mischevious]: I hesitate to use the word "malicious" here, and you'll see why.

@@ -122,6 +122,7 @@ async fn manage_store(
             continue;
         }
 
+        // If the request contains an '=', it's an insert.
         if let Some(n) = request.iter().position(|&b| b == b'=') {
             if &request[..n] == b"version" {
                 // Let this request hit the flooooooooor.
@@ -139,11 +140,14 @@ async fn manage_store(
 
             store.insert(key, val);
 
+        // Otherwise, it's a retrieve.
         } else {
             if let Some(val) = store.get(request) {
-                // The length of the response.
+                // The extra byte in the length of the response is for the '='.
                 let length = val.len() + request.len() + 1;
 
+                // The slicing involved in copying the response data into the
+                // Buffer is a little tricky.
                 let mut bytes = buffer();
                 (&mut bytes[..request.len()]).clone_from_slice(request);
                 bytes[request.len()] = b'=';
