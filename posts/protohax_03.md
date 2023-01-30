@@ -1,6 +1,6 @@
 title: Protohackers in Rust, Part 03
 subtitle: Synchronization and Cancellation
-time: 2023-01-22 20:54:00
+time: 2023-01-27 23:45:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the fourth Protohackers problem
 
