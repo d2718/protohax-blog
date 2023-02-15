@@ -4,13 +4,19 @@ The protocol spoken by camera and dispatcher clients.
 use std::{
     convert::TryInto,
     fmt::{Debug, Display, Formatter},
-    io::{Cursor, Write},
+    io::{self, Cursor, Read, Write},
 };
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::error::Error;
+use crate::{
+    error::Error,
+};
 
+const LPU16ARR_LEN: usize = 256;
+
+
+/*
 /// Class to read, write, and represent the length-prefixed string.
 ///
 /// As they are length-prefixed by a single u8, a 256-byte backing array
@@ -85,7 +91,7 @@ impl Debug for LPString {
 /// much like the LPString above.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LPU16Array {
-    data: [u16; 256],
+    data: [u16; 32],
     length: usize,
 }
 
@@ -93,8 +99,11 @@ impl LPU16Array {
     pub async fn read<R>(r: &mut R) -> Result<LPU16Array, Error>
     where R: AsyncReadExt + Unpin
     {
-        let mut data = [0u16; 256];
+        let mut data = [0u16; 32];
         let length = r.read_u8().await? as usize;
+        if length > 32 {
+            panic!("max LPU16Array size is 32");
+        }
         for n in 0..length {
             data[n] = r.read_u16().await?;
         }
@@ -103,6 +112,119 @@ impl LPU16Array {
     }
 
     pub fn as_slice(&self) -> &[u16] { &self.data[..self.length] }
+}
+
+*/
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub struct LPString {
+    bytes: [u8; 256],
+    length: usize
+}
+
+impl LPString {
+    pub fn as_slice(&self) -> &[u8] { &self.bytes[..self.length] }
+
+    pub fn write<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        let length: u8 = self.length.try_into().unwrap();
+        w.write_all(&[length])?;
+        w.write_all(self.as_slice())
+    }
+}
+
+impl<A> From<A> for LPString
+where A: AsRef<[u8]> + Sized
+{
+    fn from(a: A) -> Self {
+        let a = a.as_ref();
+        let mut bytes = [0u8; 256];
+        let mut length = a.len();
+        if length > 255 {
+            length = 255;
+            bytes.copy_from_slice(&a[..length]);
+        } else {
+            (&mut bytes[..length]).copy_from_slice(a);
+        }
+
+        LPString{ bytes, length }
+    }
+}
+
+impl Display for LPString {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &String::from_utf8_lossy(self.as_slice()))
+    }
+}
+
+impl Debug for LPString {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LPString({:?})", &String::from_utf8_lossy(self.as_slice()))
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct LPU16Array {
+    data: [u16; LPU16ARR_LEN],
+    length: usize,
+}
+
+impl LPU16Array {
+    pub fn as_slice(&self) -> &[u16] { &self.data[..self.length] }
+}
+
+impl Debug for LPU16Array {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "LPU16Array({:?})", &self.as_slice())
+    }
+}
+
+pub struct BCursor<T: AsRef<[u8]>> {
+    cursor: Cursor<T>,
+}
+
+impl<T: AsRef<[u8]>> BCursor<T> {
+    pub fn new(t: T) -> BCursor<T> {
+        BCursor{ cursor: Cursor::new(t) }
+    }
+
+    pub fn position(&self) -> usize { self.cursor.position() as usize }
+
+    pub fn read_u8(&mut self) -> io::Result<u8> {
+        let mut buff = [0u8; 1];
+        self.cursor.read_exact(&mut buff)?;
+        Ok(buff[0])
+    }
+
+    pub fn read_u16(&mut self) -> io::Result<u16> {
+        let mut buff = [0u8; 2];
+        self.cursor.read_exact(&mut buff)?;
+        Ok(u16::from_be_bytes(buff))
+    }
+
+    pub fn read_u32(&mut self) -> io::Result<u32> {
+        let mut buff = [0u8; 4];
+        self.cursor.read_exact(&mut buff)?;
+        Ok(u32::from_be_bytes(buff))
+    }
+
+    pub fn read_lpstring(&mut self) -> io::Result<LPString> {
+        let mut bytes = [0u8; 256];
+        let length = self.read_u8()? as usize;
+        self.cursor.read_exact(&mut bytes[..length])?;
+        Ok(LPString { bytes, length })
+    }
+
+    pub fn read_lpu16arr(&mut self) -> io::Result<LPU16Array> {
+        let mut data = [0u16; LPU16ARR_LEN];
+        let length = self.read_u8()? as usize;
+        if length > LPU16ARR_LEN {
+            panic!("max LPU16Array size is {}", &LPU16ARR_LEN);
+        }
+        for n in 0..length {
+            data[n] = self.read_u16()?;
+        }
+        Ok(LPU16Array{ data, length })
+    }
 }
 
 /// Messages that the server might receive.
@@ -120,37 +242,35 @@ pub enum ClientMessage {
 
 impl ClientMessage {
     /// Read a ClientMessage from the given AsyncReader
-    pub async fn read<R>(r: &mut R) -> Result<ClientMessage, Error>
-    where R: AsyncReadExt + Unpin
-    {
+    pub fn read<T: AsRef<[u8]>>(r: &mut BCursor<T>) -> Result<ClientMessage, Error> {
         use ClientMessage::*;
 
-        let msg_type = r.read_u8().await?;
+        let msg_type = r.read_u8()?;
 
         match msg_type {
             0x20 => {
-                let plate = LPString::read(r).await?;
-                let timestamp = r.read_u32().await?;
+                let plate = r.read_lpstring()?;
+                let timestamp = r.read_u32()?;
 
                 Ok(ClientMessage::Plate{ plate, timestamp })
             },
 
             0x40 => {
-                let interval = r.read_u32().await?;
+                let interval = r.read_u32()?;
 
                 Ok(WantHeartbeat{ interval })
             },
 
             0x80 => {
-                let road = r.read_u16().await?;
-                let mile = r.read_u16().await?;
-                let limit = r.read_u16().await?;
+                let road = r.read_u16()?;
+                let mile = r.read_u16()?;
+                let limit = r.read_u16()?;
 
                 Ok(IAmCamera{ road, mile, limit })
             },
 
             0x81 => {
-                let roads = LPU16Array::read(r).await?;
+                let roads = r.read_lpu16arr()?;
 
                 Ok(IAmDispatcher{ roads })
             },

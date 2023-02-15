@@ -1,10 +1,13 @@
 /*!
 Bookkeeping and behavior of the types of clients.
 */
-use std::time::Duration;
+use std::{
+    io::ErrorKind,
+    time::Duration,
+};
 
 use tokio::{
-    io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
+    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::mpsc::{Receiver, UnboundedSender},
     time::{Instant, Interval, interval_at},
@@ -18,18 +21,23 @@ use crate::{
     obs::{Infraction, Obs},
 };
 
+const IO_BUFF_SIZE: usize = 1024;
+
 /// Wraps a TcpStream so the read half is buffered.
 struct IOPair {
-    reader: BufReader<ReadHalf<TcpStream>>,
+    reader: ReadHalf<TcpStream>,
     writer: WriteHalf<TcpStream>,
+    buffer: [u8; IO_BUFF_SIZE],
+    idx: usize,
 }
 
 impl From<TcpStream> for IOPair {
     fn from(socket: TcpStream) -> Self {
         let (reader, writer) = tokio::io::split(socket);
         IOPair {
-            reader: BufReader::new(reader),
-            writer
+            reader, writer,
+            buffer: [0u8; IO_BUFF_SIZE],
+            idx: 0
         }
     }
 }
@@ -37,7 +45,42 @@ impl From<TcpStream> for IOPair {
 impl IOPair {
     /// Read a ClientMessage from the socket.
     pub async fn read(&mut self) -> Result<ClientMessage, Error> {
-        ClientMessage::read(&mut self.reader).await.map_err(|e| e.into())
+        loop {
+            {
+                let mut curs = BCursor::new(
+                    &self.buffer[..self.idx]
+                );
+                let res = ClientMessage::read(&mut curs);
+                match res {
+                    Ok(msg) => {
+                        let cpos = curs.position();
+                        let span = self.idx - cpos;
+                        let mut buff = [0u8; IO_BUFF_SIZE];
+                        (&mut buff[..span]).copy_from_slice(&self.buffer[cpos..self.idx]);
+                        (&mut self.buffer[..span]).copy_from_slice(&buff[..span]);
+                        self.idx = span;
+                        return Ok(msg);
+                    },
+                    Err(Error::Disconnected) => {
+                        // No or only partial ClientMessage in buffer.
+                    },
+                    Err(e) => { return Err(e); }
+                }
+            }
+
+            let res = self.reader.read(&mut self.buffer[self.idx..]).await;
+            match res? {
+                0 => { return Err(Error::Disconnected); },
+                n => {
+                    self.idx += n;
+                    if self.idx > 1000 {
+                        return Err(Error::ClientError(
+                            "filled read buffer w/o completing a message".into()
+                        ));
+                    }
+                },
+            }
+        }
     }
 
     /// Write a ServerMessage to the socket.
@@ -47,7 +90,7 @@ impl IOPair {
 
     /// Shut the underlying TcpStream down so it can be dropped cleanly.
     pub async fn shutdown(self) -> Result<(), Error> {
-        let mut socket = self.reader.into_inner().unsplit(self.writer);
+        let mut socket = self.reader.unsplit(self.writer);
         socket.shutdown().await.map_err(|e| e.into())
     }
 }
@@ -109,8 +152,8 @@ impl Client {
         socket: TcpStream,
         tx: UnboundedSender<Event>,
         rx: Receiver<Infraction>,
-     ) -> Unidentified {
-        Unidentified {
+     ) -> Client {
+        Client {
             id, tx, rx,
             heart: Heartbeat::new(),
             socket: IOPair::from(socket)

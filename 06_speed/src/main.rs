@@ -24,7 +24,7 @@ use tracing_subscriber::{
 };
 
 use crate::{
-    clients::Unidentified,
+    clients::Client,
     events::Event,
     message::{LPString, LPU16Array},
     obs::{Car, Infraction, Obs},
@@ -32,7 +32,7 @@ use crate::{
 
 static LOCAL_ADDR: &str = "0.0.0.0:12321";
 /// Size of outgoing channels; ingoing channel is unbounded.
-const CHAN_SIZE: usize = 1;
+const CHAN_SIZE: usize = 16;
 
 /// Holds a handle to each dispatcher task from the main task.
 struct Dispatcher{
@@ -50,7 +50,7 @@ fn add_observation(
     pos: Obs
 ) -> Option<Infraction> {
     // We will ticket at most once for each infraction.
-    let mut ticket: Option<Infraction> = None;
+    let mut ticket: [Option<Infraction>; 2] = None;
 
     if let Some(car) = map.get_mut(&plate) {
         if let Some(inf) = car.observed(road, limit, pos) {
@@ -163,7 +163,7 @@ async fn main() {
                         "accpted client {} from {:?}", &client_n, &addr
                     );
                     let (out_tx, out_rx) = mpsc::channel::<Infraction>(CHAN_SIZE);
-                    let client = Unidentified::new(
+                    let client = Client::new(
                         client_n, stream, tx.clone(), out_rx
                     );
                     unid_clients.insert(client_n, out_tx);

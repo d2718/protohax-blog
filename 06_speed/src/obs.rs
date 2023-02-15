@@ -1,6 +1,8 @@
 /*!
 Types for keeping track of observations of vehicles.
 */
+use std::collections::BTreeMap;
+
 use tracing::{event, Level};
 
 use crate::message::LPString;
@@ -78,16 +80,16 @@ pub struct Infraction {
 /// Stores a record of observations and issued tickets.
 pub struct Car {
     plate: LPString,
-    road: u16,
-    observations: Vec<Obs>,
+    observations: BTreeMap<u16, Vec<Obs>>,
     ticketed: Vec<Day>,
 }
 
 impl Car {
     pub fn new(plate: LPString, road: u16, obs: Obs) -> Car {
+        let mut observations = BTreeMap::new();
+        observations.insert(road, vec![obs]);
         Car {
-            plate, road,
-            observations: vec![obs],
+            plate, observations,
             ticketed: Vec::new(),
         }
     }
@@ -98,8 +100,8 @@ impl Car {
     pub fn observed(&mut self, road: u16, limit: u16, obs: Obs) -> Option<Infraction> {
         let mut r_val: Option<Infraction> = None;
 
-        if self.road == road {
-            for &prev in self.observations.iter() {
+        if let Some(list) = self.observations.get_mut(&road) {
+            for &prev in list.iter() {
                 let speed = obs.speed_between(&prev);
                 if speed > limit {
                     if obs.timestamp > prev.timestamp {
@@ -120,11 +122,10 @@ impl Car {
                     break;
                 }
             }
-            self.observations.push(obs);
+            list.push(obs);
 
         } else {
-            self.road = road;
-            self.observations = vec![obs];
+            self.observations.insert(road, vec![obs]);
         }
 
         r_val
