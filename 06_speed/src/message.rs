@@ -9,25 +9,13 @@ use std::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// For easier error handling, we will define our own error type that
-/// will implement From<std::io::Error>
-#[derive(Debug)]
-pub enum Error {
-    IOError(std::io::Error),
-    ClientError(String),
-}
-
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::IOError(e)
-    }
-}
+use crate::error::Error;
 
 /// Class to read, write, and represent the length-prefixed string.
 ///
 /// As they are length-prefixed by a single u8, a 256-byte backing array
 /// should be long enough to hold any possible string.
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LPString {
     bytes: [u8; 256],
     length: usize,
@@ -102,22 +90,6 @@ pub struct LPU16Array {
 }
 
 impl LPU16Array {
-    pub fn from<A>(a: &A) -> LPU16Array
-    where A: AsRef<[u16]> + Sized
-    {
-        let a = a.as_ref();
-        let mut data = [0u16; 256];
-        let mut length = a.len();
-        if length > 255 {
-            length = 255;
-            data.copy_from_slice(&a[..length]);
-        } else {
-            (&mut data[..length]).copy_from_slice(a);
-        }
-
-        LPU16Array { data, length }
-    }
-
     pub async fn read<R>(r: &mut R) -> Result<LPU16Array, Error>
     where R: AsyncReadExt + Unpin
     {

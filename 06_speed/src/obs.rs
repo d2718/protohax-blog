@@ -1,12 +1,15 @@
 /*!
 Types for keeping track of observations of vehicles.
 */
+use tracing::{event, Level};
+
 use crate::message::LPString;
 
 /// A struct so we don't get our timestamps and our days confused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Day(u32);
 
+/// A single observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Obs {
     pub mile: u16,
@@ -30,26 +33,28 @@ impl Obs {
             return 0;
         }
 
-        let d0 = self.mile as f32;
-        let t0 = self.timestamp as f32;
-        let d1 = other.mile as f32;
-        let t1 = other.timestamp as f32;
+        // We cast to a signed integer type in case d0 > d1 or t0 > t1;
+        // we cast to a larger integer type so we don't overflow.
+        let d0 = self.mile as i64;
+        let t0 = self.timestamp as i64;
+        let d1 = other.mile as i64;
+        let t1 = other.timestamp as i64;
 
-        // hundredths of a mile
-        let d_d = (d1 - d0) * 100.0;
-        // hours
-        let d_t = (t1 - t0) / 3600.0;
-
-        let fspeed = (d_d / d_t).abs();
+        // We multiply our numerator by 3600 instead of dividing our
+        // denominator by 3600; that way we only ever truncate on
+        // the final division operation.
+        let d_d = (d1 - d0) * 100 * 3600;
+        let d_t = t1 - t0;
+        let ispeed = (d_d / d_t).abs();
 
         // The spec says this will never happen, but we're going to make sure
         // we don't crash just in case it does. We'll consider it UB and just
         // return the easiest thing.
-        if fspeed > 65530.0 {
+        if ispeed > 65535 {
             return 0;
         }
 
-        let uspeed: u16 = fspeed.floor() as u16;
+        let uspeed = ispeed as u16;
         uspeed
     }
 
@@ -63,6 +68,7 @@ impl Obs {
 /// The coordinates that go along with a speeding ticket.
 #[derive(Clone, Copy, Debug)]
 pub struct Infraction {
+    pub plate: LPString,
     pub road: u16,
     pub start: Obs,
     pub end: Obs,
@@ -78,10 +84,10 @@ pub struct Car {
 }
 
 impl Car {
-    pub fn new(plate: LPString, road: u16, mile: u16, timestamp: u32) -> Car {
+    pub fn new(plate: LPString, road: u16, obs: Obs) -> Car {
         Car {
             plate, road,
-            observations: vec![Obs::new(mile, timestamp)],
+            observations: vec![obs],
             ticketed: Vec::new(),
         }
     }
@@ -98,12 +104,14 @@ impl Car {
                 if speed > limit {
                     if obs.timestamp > prev.timestamp {
                         r_val = Some(Infraction{
+                            plate: self.plate.clone(),
                             road, speed,
                             start: prev,
                             end: obs,
                         });
                     } else {
                         r_val = Some(Infraction{
+                            plate: self.plate.clone(),
                             road, speed,
                             start: obs,
                             end: prev
@@ -125,11 +133,22 @@ impl Car {
     /// Check whether this vehicle was ticketed on the given day. if so,
     /// mark it as having been ticketed.
     pub fn ok_to_ticket(&mut self, d: Day) -> bool {
+        event!(Level::DEBUG,
+            "Car[{}]::okay_to_ticket({:?}) called; currently {:?}",
+            &self.plate, &d, &self.ticketed
+        );
+
         if self.ticketed.contains(&d) {
+            event!(Level::DEBUG,
+                "   returns false; currently {:?}", &self.ticketed
+            );
             return false;
         }
 
         self.ticketed.push(d);
+        event!(Level::DEBUG,
+            "   returns true; currently {:?}", &self.ticketed
+        );
         true
     }
 }

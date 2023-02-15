@@ -1,10 +1,10 @@
 /*!
-The types of messages that can be sent between client tasks and the central
+The types of messages that can be sent from a client task to the central
 server task.
 */
 use crate::{
     message::{LPU16Array, LPString},
-    obs::{Infraction, Obs},
+    obs::Obs,
 };
 
 #[derive(Clone, Debug)]
@@ -23,10 +23,5 @@ pub enum Event {
         road: u16,
         limit: u16,
         pos: Obs,
-    },
-    /// Issue a ticket with the given parameters.
-    Ticket {
-        plate: LPString,
-        info: Infraction,
     },
 }
