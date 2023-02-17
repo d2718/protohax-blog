@@ -3,7 +3,7 @@ The types of messages that can be sent from a client task to the central
 server task.
 */
 use crate::{
-    message::{LPU16Array, LPString},
+    bio::{LPU16Array, LPString},
     obs::Obs,
 };
 

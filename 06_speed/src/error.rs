@@ -2,16 +2,14 @@
  For easier error handling, we will define our own error type that
 will implements From for a couple of handy other error types.
 */
-use std::{
-    fmt::Debug,
-    io::ErrorKind,
-};
+use std::io::ErrorKind;
+use std::fmt::Debug;
 
 use tokio::sync::mpsc::error::SendError;
 
 #[derive(Debug)]
 pub enum Error {
-    Disconnected,
+    Eof,
     IOError(std::io::Error),
     ClientError(String),
     ServerError(String),
@@ -20,9 +18,9 @@ pub enum Error {
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         if e.kind() == ErrorKind::UnexpectedEof {
-            Self::Disconnected
+            Error::Eof
         } else {
-            Self::IOError(e)
+            Error::IOError(e)
         }
     }
 }

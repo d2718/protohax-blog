@@ -1,0 +1,18 @@
+app = "floral-forest-5384"
+kill_signal = "SIGINT"
+kill_timeout = 5
+
+[env]
+RUST_LOG = "speed=trace"
+
+[[services]]
+  internal_port = 12321
+  protocol = "tcp"
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+  [[services.ports]]
+    port = 12321

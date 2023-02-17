@@ -7,11 +7,10 @@ use std::{
     io::{self, Cursor, Read, Write},
 };
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
+use tracing::{event, Level};
 
-use crate::{
-    error::Error,
-};
+use crate::error::Error;
 
 const LPU16ARR_LEN: usize = 256;
 
@@ -348,6 +347,8 @@ impl ServerMessage {
         let length: usize = cursor.position().try_into().unwrap();
         let buff = cursor.into_inner();
         w.write_all(&buff[..length]).await?;
+        w.flush().await?;
+        event!(Level::DEBUG, "wrote message {:x?}", &buff[..length]);
 
         Ok(())
     }

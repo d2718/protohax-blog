@@ -1,13 +1,9 @@
 /*!
 Bookkeeping and behavior of the types of clients.
 */
-use std::{
-    io::ErrorKind,
-    time::Duration,
-};
+use std::time::Duration;
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     net::TcpStream,
     sync::mpsc::{Receiver, UnboundedSender},
     time::{Instant, Interval, interval_at},
@@ -15,85 +11,12 @@ use tokio::{
 use tracing::{event, Level, span};
 
 use crate::{
-    error::Error,
+    bio::*,
     events::Event,
-    message::*,
     obs::{Infraction, Obs},
 };
 
-const IO_BUFF_SIZE: usize = 1024;
-
-/// Wraps a TcpStream so the read half is buffered.
-struct IOPair {
-    reader: ReadHalf<TcpStream>,
-    writer: WriteHalf<TcpStream>,
-    buffer: [u8; IO_BUFF_SIZE],
-    idx: usize,
-}
-
-impl From<TcpStream> for IOPair {
-    fn from(socket: TcpStream) -> Self {
-        let (reader, writer) = tokio::io::split(socket);
-        IOPair {
-            reader, writer,
-            buffer: [0u8; IO_BUFF_SIZE],
-            idx: 0
-        }
-    }
-}
-
-impl IOPair {
-    /// Read a ClientMessage from the socket.
-    pub async fn read(&mut self) -> Result<ClientMessage, Error> {
-        loop {
-            {
-                let mut curs = BCursor::new(
-                    &self.buffer[..self.idx]
-                );
-                let res = ClientMessage::read(&mut curs);
-                match res {
-                    Ok(msg) => {
-                        let cpos = curs.position();
-                        let span = self.idx - cpos;
-                        let mut buff = [0u8; IO_BUFF_SIZE];
-                        (&mut buff[..span]).copy_from_slice(&self.buffer[cpos..self.idx]);
-                        (&mut self.buffer[..span]).copy_from_slice(&buff[..span]);
-                        self.idx = span;
-                        return Ok(msg);
-                    },
-                    Err(Error::Disconnected) => {
-                        // No or only partial ClientMessage in buffer.
-                    },
-                    Err(e) => { return Err(e); }
-                }
-            }
-
-            let res = self.reader.read(&mut self.buffer[self.idx..]).await;
-            match res? {
-                0 => { return Err(Error::Disconnected); },
-                n => {
-                    self.idx += n;
-                    if self.idx > 1000 {
-                        return Err(Error::ClientError(
-                            "filled read buffer w/o completing a message".into()
-                        ));
-                    }
-                },
-            }
-        }
-    }
-
-    /// Write a ServerMessage to the socket.
-    pub async fn write(&mut self, msg: ServerMessage) -> Result<(), Error> {
-        msg.write(&mut self.writer).await.map_err(|e| e.into())
-    }
-
-    /// Shut the underlying TcpStream down so it can be dropped cleanly.
-    pub async fn shutdown(self) -> Result<(), Error> {
-        let mut socket = self.reader.unsplit(self.writer);
-        socket.shutdown().await.map_err(|e| e.into())
-    }
-}
+static CHANNEL_CLOSED: &str = "main channel closed";
 
 /// A struct to provide an optional heartbeat.
 /// 
@@ -163,12 +86,18 @@ impl Client {
      async fn wrapped_run(&mut self) -> Result<(), Error> {
         loop {
             tokio::select!{
+                biased;
+
+                _ = self.heart.beat() => {
+                    self.socket.write(ServerMessage::Heartbeat).await?;
+                },
+
                 msg = self.socket.read() => {
                     event!(Level::TRACE, "client {} message: {:?}", &self.id, &msg);
                     match msg? {
                         ClientMessage::IAmCamera{ road, mile, limit } => {
                             let evt = Event::Camera{ id: self.id };
-                            self.tx.send(evt)?;
+                            self.tx.send(evt).expect(CHANNEL_CLOSED);
                             // Server reports limit in mi/hr, but all of our
                             // calculations (and our dispatching) is done in
                             // hundredths of mi/hr.
@@ -182,7 +111,7 @@ impl Client {
                             let evt = Event::Dispatcher{
                                 id: self.id, roads
                             };
-                            self.tx.send(evt)?;
+                            self.tx.send(evt).expect(CHANNEL_CLOSED);
                             return self.run_as_dispatcher().await;
                             
                         },
@@ -195,7 +124,7 @@ impl Client {
                                     )
                                 };
                                 self.socket.write(msg).await?;
-                                return Err(Error::ClientError(
+                                return Err(Error::ProtocolError(
                                     "multiple heartbeat requests".into()
                                 ));
                             } else {
@@ -210,15 +139,11 @@ impl Client {
                                 )
                             };
                             self.socket.write(errmsg).await?;
-                            return Err(Error::ClientError(format!(
+                            return Err(Error::ProtocolError(format!(
                                 "sent {:?} without identifying", &msg
                             )));
                         },
                     }
-                },
-
-                _ = self.heart.beat() => {
-                    self.socket.write(ServerMessage::Heartbeat).await?;
                 },
             }
         }
@@ -229,13 +154,8 @@ impl Client {
 
         if let Err(e) = self.wrapped_run().await {
             match e {
-                Error::Disconnected => {
-                    event!(Level::TRACE,
-                        "client {} disconnected", &self.id
-                    );
-                },
-                Error::IOError(_) |
-                Error::ServerError(_) => {
+                Error::Eof => { /* clean */ },
+                Error::IOError(_) => {
                     event!(Level::ERROR, "client {}: {:?}", &self.id, &e);
                     let msg = ServerMessage::Error{
                         msg: LPString::from(
@@ -244,7 +164,7 @@ impl Client {
                     };
                     let _ = self.socket.write(msg).await;
                 },
-                Error::ClientError(cerr) => {
+                Error::ProtocolError(cerr) => {
                     event!(Level::ERROR,
                         "client {} error: {}", &self.id, &cerr
                     );
@@ -289,7 +209,7 @@ impl Client {
                             let evt = Event::Observation{
                                 plate, road, limit, pos
                             };
-                            self.tx.send(evt)?;
+                            self.tx.send(evt).expect(CHANNEL_CLOSED);
                         },
 
                         ClientMessage::WantHeartbeat{ interval } => {
@@ -300,7 +220,7 @@ impl Client {
                                     )
                                 };
                                 self.socket.write(errmsg).await?;
-                                return Err(Error::ClientError(
+                                return Err(Error::ProtocolError(
                                     "multiple heartbeat requests".into()
                                 ));
                             } else {
@@ -315,7 +235,7 @@ impl Client {
                                 )
                             };
                             self.socket.write(errmsg).await?;
-                            return Err(Error::ClientError(
+                            return Err(Error::ProtocolError(
                                 format!("Camera sent {:?}", &msg)
                             ));
                         },
@@ -344,7 +264,7 @@ impl Client {
                                     )
                                 };
                                 self.socket.write(errmsg).await?;
-                                return Err(Error::ClientError(
+                                return Err(Error::ProtocolError(
                                     "multiple heartbeat requests".into()
                                 ));
                             } else {
@@ -353,7 +273,7 @@ impl Client {
                         },
 
                         msg => {
-                            return Err(Error::ClientError(
+                            return Err(Error::ProtocolError(
                                 format!("illegal msg: {:?}", &msg)
                             ));
                         },
@@ -374,6 +294,9 @@ impl Client {
                                 timestamp2: end.timestamp,
                             };
                             self.socket.write(msg).await?;
+                            event!(Level::DEBUG,
+                                "client {} wrote Infraction for {:?}", &self.id, &plate
+                            );
                         },
 
                         None => {

@@ -1,0 +1,7 @@
+# Ignore _everything_ except the musl release binary.
+src
+target
+!target/x86_64-unknown-linux-musl/release/speed
+build.sh
+Cargo.toml
+Cargo.lock

@@ -1,14 +1,14 @@
 /*!
 Types for keeping track of observations of vehicles.
 */
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tracing::{event, Level};
 
-use crate::message::LPString;
+use crate::bio::LPString;
 
 /// A struct so we don't get our timestamps and our days confused.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Day(u32);
 
 /// A single observation.
@@ -81,7 +81,7 @@ pub struct Infraction {
 pub struct Car {
     plate: LPString,
     observations: BTreeMap<u16, Vec<Obs>>,
-    ticketed: Vec<Day>,
+    ticketed: BTreeSet<Day>,
 }
 
 impl Car {
@@ -90,7 +90,7 @@ impl Car {
         observations.insert(road, vec![obs]);
         Car {
             plate, observations,
-            ticketed: Vec::new(),
+            ticketed: BTreeSet::new(),
         }
     }
 
@@ -98,10 +98,21 @@ impl Car {
     ///
     /// If an Infraction is warranted, return that.
     pub fn observed(&mut self, road: u16, limit: u16, obs: Obs) -> Option<Infraction> {
+        let d = obs.day();
+        if self.ticketed.contains(&d) {
+            event!(Level::DEBUG,
+                "{} already ticketed on {:?}; ignorning", &self.plate, &d
+            );
+            return None;
+        }
+
         let mut r_val: Option<Infraction> = None;
 
         if let Some(list) = self.observations.get_mut(&road) {
             for &prev in list.iter() {
+                if self.ticketed.contains(&prev.day()) {
+                    continue;
+                }
                 let speed = obs.speed_between(&prev);
                 if speed > limit {
                     if obs.timestamp > prev.timestamp {
@@ -131,26 +142,17 @@ impl Car {
         r_val
     }
 
-    /// Check whether this vehicle was ticketed on the given day. if so,
-    /// mark it as having been ticketed.
+    /// Check whether this vehicle was ticketed on the given day.
     pub fn ok_to_ticket(&mut self, d: Day) -> bool {
-        event!(Level::DEBUG,
-            "Car[{}]::okay_to_ticket({:?}) called; currently {:?}",
-            &self.plate, &d, &self.ticketed
-        );
+        !self.ticketed.contains(&d)
+    }
 
-        if self.ticketed.contains(&d) {
-            event!(Level::DEBUG,
-                "   returns false; currently {:?}", &self.ticketed
-            );
-            return false;
+    /// Record that this vehicle was ticketed on the given day.
+    pub fn set_ticketed(&mut self, d: Day) {
+        self.ticketed.insert(d);
+        for (_, obs_v) in self.observations.iter_mut() {
+            obs_v.retain(|o| !self.ticketed.contains(&o.day()));
         }
-
-        self.ticketed.push(d);
-        event!(Level::DEBUG,
-            "   returns true; currently {:?}", &self.ticketed
-        );
-        true
     }
 }
 

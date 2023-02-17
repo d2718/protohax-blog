@@ -4,10 +4,9 @@ Protohackers Problem 6: Speed Daemon
 Implement an
 [automatic ticket-issusing system](https://protohackers.com/problem/6).
 */
+mod bio;
 mod clients;
-mod error;
 mod events;
-mod message;
 mod obs;
 
 use std::collections::BTreeMap;
@@ -26,15 +25,18 @@ use tracing_subscriber::{
 use crate::{
     clients::Client,
     events::Event,
-    message::{LPString, LPU16Array},
+    bio::{LPString, LPU16Array},
     obs::{Car, Infraction, Obs},
 };
 
 static LOCAL_ADDR: &str = "0.0.0.0:12321";
-/// Size of outgoing channels; ingoing channel is unbounded.
+/// Size of outgoing channels.
 const CHAN_SIZE: usize = 16;
+// Size of return channel.
+//const RETURN_SIZE: usize = 16;
 
 /// Holds a handle to each dispatcher task from the main task.
+#[derive(Debug)]
 struct Dispatcher{
     chan: mpsc::Sender<Infraction>,
     roads: LPU16Array,
@@ -50,7 +52,7 @@ fn add_observation(
     pos: Obs
 ) -> Option<Infraction> {
     // We will ticket at most once for each infraction.
-    let mut ticket: [Option<Infraction>; 2] = None;
+    let mut ticket: Option<Infraction> = None;
 
     if let Some(car) = map.get_mut(&plate) {
         if let Some(inf) = car.observed(road, limit, pos) {
@@ -76,6 +78,13 @@ fn add_observation(
                     );
                 }
             }
+
+            if ticket.is_some() {
+                car.set_ticketed(start_day);
+                if start_day != end_day {
+                    car.set_ticketed(end_day);
+                }
+            }
         }
     } else {
         map.insert(plate, Car::new(plate, road, pos));
@@ -95,6 +104,10 @@ async fn dispose_ticket(
     if let Some(ids) = coverage.get(&ticket.road) {
         for id in ids.iter() {
             if let Some(d) = dispatchers.get(id) {
+                event!(Level::TRACE,
+                    "sending ticket to Dispatcher {}: {:?}",
+                    id, &ticket
+                );
                 if let Err(e) = d.chan.send(ticket).await {
                     event!(Level::ERROR,
                         "can't send to dispatcher {}: {}", id, &e
@@ -105,6 +118,9 @@ async fn dispose_ticket(
         }
     }
 
+    event!(Level::TRACE,
+        "no Dispatcher available; storing ticket {:?}", &ticket
+    );
     tickets.entry(ticket.road).or_default().push(ticket);
 }
 
@@ -130,7 +146,7 @@ fn remove_roads(
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::registry()
     .with(layer())
@@ -155,8 +171,10 @@ async fn main() {
     event!(Level::DEBUG, "listening on {:?}", &listener.local_addr().unwrap());
 
     let mut client_n: usize = 0;
+    let mut n_connected: usize = 0;
     loop {
         tokio::select!{
+            biased;
             res = listener.accept() => match res {
                 Ok((stream, addr)) => {
                     event!(Level::DEBUG,
@@ -171,6 +189,10 @@ async fn main() {
                         client.run().await;
                     });
                     client_n += 1;
+                    n_connected += 1;
+                    event!(Level::DEBUG,
+                        "connected count: {}", &n_connected
+                    );
                 },
                 Err(e) => {
                     event!(Level::WARN,
@@ -210,11 +232,16 @@ async fn main() {
                                 event!(Level::TRACE,
                                     "removed unidentified client {}", &id
                                 );
-                            } else {
-                                event!(Level::TRACE,
-                                    "no client with id {} (was Camera?)", &id
-                                );
-                            }
+                            } 
+                        }
+                        n_connected = n_connected.saturating_sub(1);
+                        event!(Level::DEBUG,
+                            "connected count: {}", &n_connected
+                        );
+                        if n_connected == 0 {
+                            event!(Level::DEBUG,
+                                "pending tickets: {:#?}", &tickets
+                            );
                         }
                     },
 
