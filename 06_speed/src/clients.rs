@@ -6,9 +6,9 @@ use std::time::Duration;
 use tokio::{
     net::TcpStream,
     sync::mpsc::{Receiver, UnboundedSender},
-    time::{Instant, Interval, interval_at},
+    time::{interval_at, Instant, Interval},
 };
-use tracing::{event, Level, span};
+use tracing::{event, span, Level};
 
 use crate::{
     bio::*,
@@ -19,16 +19,20 @@ use crate::{
 static CHANNEL_CLOSED: &str = "main channel closed";
 
 /// A struct to provide an optional heartbeat.
-/// 
+///
 /// Can be set to either resolve at regular intervals, or never, so it can
 /// be used in a join! either way.
 struct Heartbeat(Option<Interval>);
 
 impl Heartbeat {
-    fn new() -> Heartbeat { Heartbeat(None) }
+    fn new() -> Heartbeat {
+        Heartbeat(None)
+    }
 
     /// Set this heart to not beat.
-    fn stop(&mut self) { self.0 = None; }
+    fn stop(&mut self) {
+        self.0 = None;
+    }
 
     /// Set this heart to beat every `n` deciseconds.
     fn set_decisecs(&mut self, n: u32) {
@@ -40,7 +44,7 @@ impl Heartbeat {
         let period = Duration::from_millis(millis);
         self.0 = Some(interval_at(
             Instant::now().checked_add(period).unwrap(),
-            period
+            period,
         ));
     }
 
@@ -54,7 +58,9 @@ impl Heartbeat {
     }
 
     /// Return whether this heartbeat is beating.
-    fn is_beating(&self) -> bool { self.0.is_some() }
+    fn is_beating(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 /// When a client first connects, it is unidentified.
@@ -75,17 +81,21 @@ impl Client {
         socket: TcpStream,
         tx: UnboundedSender<Event>,
         rx: Receiver<Infraction>,
-     ) -> Client {
+    ) -> Client {
         Client {
-            id, tx, rx,
+            id,
+            tx,
+            rx,
             heart: Heartbeat::new(),
-            socket: IOPair::from(socket)
+            socket: IOPair::from(socket),
         }
-     }
+    }
 
-     async fn wrapped_run(&mut self) -> Result<(), Error> {
+    async fn wrapped_run(&mut self) -> Result<(), Error> {
         loop {
-            tokio::select!{
+            tokio::select! {
+                // We are running a biased select because we want to
+                // prioritize sending a Heartbeat if one's due.
                 biased;
 
                 _ = self.heart.beat() => {
@@ -99,7 +109,7 @@ impl Client {
                             let evt = Event::Camera{ id: self.id };
                             self.tx.send(evt).expect(CHANNEL_CLOSED);
                             // Server reports limit in mi/hr, but all of our
-                            // calculations (and our dispatching) is done in
+                            // calculations (and our dispatching) are done in
                             // hundredths of mi/hr.
                             let limit = limit * 100;
                             return self.run_as_camera(
@@ -113,7 +123,7 @@ impl Client {
                             };
                             self.tx.send(evt).expect(CHANNEL_CLOSED);
                             return self.run_as_dispatcher().await;
-                            
+
                         },
 
                         ClientMessage::WantHeartbeat{ interval } => {
@@ -147,65 +157,57 @@ impl Client {
                 },
             }
         }
-     }
+    }
 
-     pub async fn run(mut self) {
+    pub async fn run(mut self) {
         span!(Level::TRACE, "run", client = &self.id);
 
         if let Err(e) = self.wrapped_run().await {
             match e {
-                Error::Eof => { /* clean */ },
+                Error::Eof => { /* clean */ }
                 Error::IOError(_) => {
                     event!(Level::ERROR, "client {}: {:?}", &self.id, &e);
-                    let msg = ServerMessage::Error{
-                        msg: LPString::from(
-                            &"the server encountered an error"
-                        )
+                    let msg = ServerMessage::Error {
+                        msg: LPString::from(&"the server encountered an error"),
                     };
                     let _ = self.socket.write(msg).await;
-                },
+                }
                 Error::ProtocolError(cerr) => {
-                    event!(Level::ERROR,
-                        "client {} error: {}", &self.id, &cerr
-                    );
-                    let msg = ServerMessage::Error{
-                        msg: LPString::from(
-                            &cerr
-                        )
+                    event!(Level::ERROR, "client {} error: {}", &self.id, &cerr);
+                    let msg = ServerMessage::Error {
+                        msg: LPString::from(&cerr),
                     };
                     let _ = self.socket.write(msg).await;
-                },
+                }
             }
         }
 
         if let Err(e) = self.socket.shutdown().await {
-            event!(Level::ERROR,
-                "client {}: error shutting down socket: {:?}", &self.id, &e
+            event!(
+                Level::ERROR,
+                "client {}: error shutting down socket: {:?}",
+                &self.id,
+                &e
             );
         }
-        if let Err(e) = self.tx.send(Event::Gone{ id: self.id }) {
+        if let Err(e) = self.tx.send(Event::Gone { id: self.id }) {
             event!(Level::ERROR, "error sending Gone({}): {:?}", &self.id, &e);
         }
         event!(Level::TRACE, "client {} disconnects", &self.id);
-     }
+    }
 
-     async fn run_as_camera(
-        &mut self,
-        road: u16,
-        mile: u16,
-        limit: u16
-    ) -> Result<(), Error> {
+    async fn run_as_camera(&mut self, road: u16, mile: u16, limit: u16) -> Result<(), Error> {
         // Don't need this anymore.
         self.rx.close();
 
         span!(Level::TRACE, "running as Camera", client = self.id);
         loop {
-            tokio::select!{
+            tokio::select! {
                 msg = self.socket.read() => {
                     event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
                     match msg? {
                         ClientMessage::Plate{ plate, timestamp } => {
-                            let pos = Obs::new(mile, timestamp);
+                            let pos = Obs{ mile, timestamp};
                             let evt = Event::Observation{
                                 plate, road, limit, pos
                             };
@@ -252,7 +254,7 @@ impl Client {
     async fn run_as_dispatcher(&mut self) -> Result<(), Error> {
         span!(Level::TRACE, "running as Dispatcher", client = self.id);
         loop {
-            tokio::select!{
+            tokio::select! {
                 msg = self.socket.read() => {
                     event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
                     match msg? {

@@ -19,8 +19,6 @@ pub struct Obs {
 }
 
 impl Obs {
-    pub fn new(mile: u16, timestamp: u32) -> Obs { Obs { mile, timestamp }}
-
     /// Determing the average speed between two observations
     /// in miles per hour x100.
     pub fn speed_between(&self, other: &Obs) -> u16 {
@@ -56,8 +54,7 @@ impl Obs {
             return 0;
         }
 
-        let uspeed = ispeed as u16;
-        uspeed
+        ispeed as u16
     }
 
     /// Number of days since epoch on which this observation occurred.
@@ -89,67 +86,70 @@ impl Car {
         let mut observations = BTreeMap::new();
         observations.insert(road, vec![obs]);
         Car {
-            plate, observations,
+            plate,
+            observations,
             ticketed: BTreeSet::new(),
         }
     }
 
     /// Record this car as being observed under the provided conditions.
     ///
-    /// If an Infraction is warranted, return that.
+    /// If an Infraction is warranted, mark the car as having been ticketed
+    /// on that day (or those days), and return the Infraction.
     pub fn observed(&mut self, road: u16, limit: u16, obs: Obs) -> Option<Infraction> {
         let d = obs.day();
         if self.ticketed.contains(&d) {
-            event!(Level::DEBUG,
-                "{} already ticketed on {:?}; ignorning", &self.plate, &d
+            event!(
+                Level::DEBUG,
+                "{} already ticketed on {:?}; ignorning",
+                &self.plate,
+                &d
             );
             return None;
         }
 
-        let mut r_val: Option<Infraction> = None;
-
         if let Some(list) = self.observations.get_mut(&road) {
-            for &prev in list.iter() {
-                if self.ticketed.contains(&prev.day()) {
-                    continue;
-                }
+            for &prev in list.iter().filter(|o| !self.ticketed.contains(&o.day())) {
                 let speed = obs.speed_between(&prev);
                 if speed > limit {
-                    if obs.timestamp > prev.timestamp {
-                        r_val = Some(Infraction{
-                            plate: self.plate.clone(),
-                            road, speed,
+                    let ticket = if obs.timestamp > prev.timestamp {
+                        Infraction {
+                            plate: self.plate,
+                            road,
+                            speed,
                             start: prev,
                             end: obs,
-                        });
+                        }
                     } else {
-                        r_val = Some(Infraction{
-                            plate: self.plate.clone(),
-                            road, speed,
+                        Infraction {
+                            plate: self.plate,
+                            road,
+                            speed,
                             start: obs,
-                            end: prev
-                        });
-                    }
-                    break;
+                            end: prev,
+                        }
+                    };
+                    self.set_ticketed(&ticket);
+                    return Some(ticket);
                 }
             }
             list.push(obs);
-
         } else {
             self.observations.insert(road, vec![obs]);
         }
 
-        r_val
+        None
     }
 
-    /// Check whether this vehicle was ticketed on the given day.
-    pub fn ok_to_ticket(&mut self, d: Day) -> bool {
-        !self.ticketed.contains(&d)
-    }
-
-    /// Record that this vehicle was ticketed on the given day.
-    pub fn set_ticketed(&mut self, d: Day) {
-        self.ticketed.insert(d);
+    /// Record that this vehicle was ticketed on the given day(s) of
+    /// the given Infraction.
+    ///
+    /// Also removes any observations from days on which the vehicle has
+    /// been ticketed; they are no longer of use.
+    fn set_ticketed(&mut self, i: &Infraction) {
+        self.ticketed.insert(i.start.day());
+        // If both days are the same, this is a no-op for a BTreeSet.
+        self.ticketed.insert(i.end.day());
         for (_, obs_v) in self.observations.iter_mut() {
             obs_v.retain(|o| !self.ticketed.contains(&o.day()));
         }
@@ -162,20 +162,38 @@ mod test {
 
     #[test]
     fn between_obs() {
-        let o1 = Obs::new(8, 0);
-        let o2 = Obs::new(9, 45);
+        let o1 = Obs {
+            mile: 8,
+            timestamp: 0,
+        };
+        let o2 = Obs {
+            mile: 9,
+            timestamp: 45,
+        };
         assert_eq!(o1.speed_between(&o2), 8000);
         assert_eq!(o2.speed_between(&o1), 8000);
 
         // Same times should be 0 speed.
-        let o1 = Obs::new(5, 25);
-        let o2 = Obs::new(6, 26);
+        let o1 = Obs {
+            mile: 5,
+            timestamp: 25,
+        };
+        let o2 = Obs {
+            mile: 6,
+            timestamp: 26,
+        };
         assert_eq!(o1.speed_between(&o2), 0);
         assert_eq!(o2.speed_between(&o1), 0);
 
         // Incredibly fast should also be zero speed.
-        let o1 = Obs::new(1000, 25);
-        let o2 = Obs::new(12, 26);
+        let o1 = Obs {
+            mile: 1000,
+            timestamp: 25,
+        };
+        let o2 = Obs {
+            mile: 12,
+            timestamp: 26,
+        };
         assert_eq!(o1.speed_between(&o2), 0);
         assert_eq!(o2.speed_between(&o1), 0);
     }
