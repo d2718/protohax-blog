@@ -39,7 +39,7 @@ pub enum Error {
     IOError(std::io::Error),
 }
 
-/// Class to read, write, and represent the length-prefixed string.
+/// Class to represent the length-prefixed string.
 ///
 /// As they are length-prefixed by a single u8, a 256-byte backing array
 /// should be long enough to hold any possible string.
@@ -348,7 +348,14 @@ impl IOPair {
             }
 
             ServerMessage::Error { msg } => {
+                // msg.length was originally cast _from_ a u8, so this should
+                // always succeed.
                 let len_byte: u8 = msg.length.try_into().unwrap();
+                // Sending this message involves two separate writes. Were
+                // we sending a lot of these, we'd probably buffer this data
+                // and just make one; as it is, this is always going to be the
+                // last message we'll send before hanging up on a client, so
+                // we won't bother.
                 self.writer.write_all(&[0x10, len_byte]).await?;
                 self.writer.write_all(msg.as_slice()).await?;
             }
@@ -363,6 +370,8 @@ impl IOPair {
                 speed,
             } => {
                 let mut c = Cursor::new([0u8; IO_BUFF_SIZE]);
+                // plate.length was originally cast _from_ a u8, so this
+                // should always succeed.
                 let len_byte: u8 = plate.length.try_into().unwrap();
 
                 c.write_all(&[0x21, len_byte])?;
@@ -374,6 +383,10 @@ impl IOPair {
                 c.write_all(&timestamp2.to_be_bytes())?;
                 c.write_all(&speed.to_be_bytes())?;
 
+                // For some reason Cursor::position() returns a u64 and
+                // not a usize. In any case, this should always be less
+                // than IO_BUFF_SIZE and thus fit into a usize, regardless
+                // of target platform.
                 let length: usize = c.position().try_into().unwrap();
                 let buff = c.into_inner();
                 self.writer.write_all(&buff[..length]).await?;

@@ -1,6 +1,6 @@
-title: Protohackers in Rust, Part 04
-subtitle: Subpart 0: The Protocol
-time: 2023-02-11 21:54:00
+title: Protohackers in Rust, Part 06 (a)
+subtitle: The Protocol
+time: 2023-02-18 16:05:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the seventh Protohackers problem
 
@@ -16,15 +16,15 @@ Because I am taking the time to blog about these, my Protohackers buddies are le
 
 [^backtracking]: The short version, if you're interested, is that I had a subtle problem with the way I was checking and dealing with whether a vehicle had already received a ticket on a given day. I _thought_, though, that the problem stemmed from the fact that my socket-reading method wasn't cancellation safe, so I spent considerable effort refactoring with that in mind. Of course this didn't fix it, so I flailed around tweaking a great many aspects of the program before I finally pinpointed my problem and fixed it. Ultimately, I ended up with better, leaner code in several places, but the majority of my "fixes" weren't necessary to complete the exercise.
 
-[The Seventh Protohackers Problem](https://protohackers.com/problem/6) is to implement a automatic system for issuing speeding tickets. The specification is pretty complicated; I'll lay out a simplified overview here:
+[The Seventh Protohackers Problem](https://protohackers.com/problem/6) is to implement an automatic system for issuing speeding tickets. The specification is pretty complicated; I'll lay out a simplified overview here:
 
 There will be two types of clients, cameras and dispatchers. Cameras will report vehicles (identified by their plates) as being at specific locations on specific roads at specific times. The server's job is to determine, based on locations and times, if and when a vehicle has exceeded the speed limit. If a vehicle warrants a ticket, the server will notifiy a dispatcher client that has responsibility for the road on which that vehicle has exceeded the speed limit.
 
 What makes this tricky is:
 
   * Time/location stamps will not necessarily arrive in chronological order.
-  * Any given vehicle can be issued at ticket for at most one infraction per day (regardless of the number of infractions committed).
-  * When the server has calculated that a given vehicle has committed and infraction, there may not necessarily be any connected dispatchers able to respond on the given road, and we'll have to wait until one shows up to issue the ticket.
+  * Any given vehicle can be issued a ticket for at most one infraction per day (regardless of the number of infractions committed).
+  * When the server has calculated that a given vehicle has committed an infraction, there may not necessarily be any connected dispatchers able to respond on the given road, and we'll have to wait until one shows up to issue the ticket.
   * Any client can request that the server send it a "heartbeat" signal at a specified regular interval, and we have to do our best to honor that request.
 
 We also have to support at least 150 clients.
@@ -37,9 +37,20 @@ $ cargo new 06_speed --name speed
 
 The cameras and dispatchers speak a binary protocol[^vaporators] that involves big-endian u8, u16, and u32 integers, as well as length-prefixed strings of 0-255 ASCII characters (and, in one place, a length-prefixed u16 array). Each message begins with a single byte value that determines its type, followed by zero or more specific fields that compose that type. We'll start by defining types to represent them then move on to reading and writing them.
 
+[^vaporators]: Very similar to your vaporators.
+
 All code in this blog entry is from the file `src/bio.rs`. We're going to need all this stuff:
 
 ```rust
+/*!
+Structs and methods for dealing with reading and writing the binary
+protocol used in this exercise.
+
+We go to a great deal of effort to make reading a cancellation-safe
+process, but in hindsight (having looked at other solutions), this
+turns out to not really be necessary.
+*/
+
 use std::{
     convert::TryInto,
     fmt::{Debug, Display, Formatter},
@@ -52,14 +63,12 @@ use tokio::{
 };
 ```
 
-[^vaporators]: Very similar to your vaporators.
-
 Our first type is the length-prefixed string. It consists of a single unsigned byte denoting its length, followed by that many ASCII characters. Because it can be at most 255 bytes long, we'll just store these in fixed-sized 256-byte arrays.[^string_length] This will require no allocation.
 
 [^string_length]: It turns out that we need much less. I don't think any of the license plates were more than seven characters long; if we didn't choose to send informative error messages, we probably wouldn't need more than seven bytes.
 
 ```rust
-/// Class to read, write, and represent the length-prefixed string.
+/// Class to represent the length-prefixed string.
 ///
 /// As they are length-prefixed by a single u8, a 256-byte backing array
 /// should be long enough to hold any possible string.
@@ -298,10 +307,10 @@ impl From<TcpStream> for IOPair {
             write_idx: 0,
         }
     }
-    }
+}
 ```
 
-First we'll write a method for synchronously reading `ClientMessage`s from our internal buffer, and then we'll use it in our async read function we can `select!` on.
+First we'll write a method for synchronously reading `ClientMessage`s from our internal buffer, and then we'll use it in our async read function we can `select!` on. On success, this will return not only the message, but also the cursor position (that is, how many bytes we had to read for the message), because our enclosing function will need to know how much of the buffer we've used.
 
 ```rust
 impl IOPair {
@@ -349,7 +358,7 @@ impl IOPair {
 
 We wrap a `Cursor` around the part of our buffer that contains data, and use our added trait methods to read from that. If the `Cursor` hits the end of the data before reading a whole message, it will return a `std::io::Error` of `ErrorKind::UnexpectedEof`; this will signal to our async read method that we need to read more bytes into the buffer.
 
-This brings us to the meat of this module, the `IOPair::read()` method, our `async` method for reading `ClientMessages` that we can safely `select!` on. It starts by first calling the method we just wrote, trying to read a message from the internal buffer. If successful, it will return that message, but not before moving any unread data to the beginning of the buffer and repositioning the buffer's write pointer appropriately. If it _can't_ read a complete `ClientMessage` from the buffer (that is, if `.inner_read()` returns with an `ErrorKind::UnexpectedEof`), it reads some more bytes from the `TcpStream` into the buffer. If this read successfully returns 0 bytes, this either means the internal buffer is full (the client has exceeded the maximum valid message size without sending a valid message) or the client has disconnected. In either case, we're done and should hang up, otherwise, we loop back around and try to read from the internal buffer again. If we encounter a non-fatal error (a `WouldBlock` or `Interrupted`), we'll [yield](https://docs.rs/tokio/latest/tokio/task/fn.yield_now.html), letting some other tasks run before trying again; on any legit error, we'll bail.
+This brings us to the meat of this module, the `IOPair::read()` method, our `async` method for reading `ClientMessages` on which we can safely `select!`. It starts by first calling the method we just wrote, trying to read a message from the internal buffer. If successful, it will return that message, but not before moving any unread data to the beginning of the buffer and repositioning the buffer's write pointer appropriately. If it _can't_ read a complete `ClientMessage` from the buffer (that is, if `.inner_read()` returns with an `ErrorKind::UnexpectedEof`), it reads some more bytes from the `TcpStream` into the buffer. If this read successfully returns 0 bytes, this either means that the internal buffer is full (the client has exceeded the maximum valid message size without sending a valid message), or that the client has disconnected; in either case, we're done and should hang up. Otherwise, we loop back around and try to read from the internal buffer again. If we encounter a non-fatal error (a `WouldBlock` or `Interrupted`), we'll [yield](https://docs.rs/tokio/latest/tokio/task/fn.yield_now.html), letting some other tasks run before trying again; on any legit error, we'll bail.
 
 ```rust
 impl IOPair {
@@ -418,3 +427,114 @@ impl IOPair {
     }
 }
 ```
+
+This might seem backward; when thinking about this operation, the natural order of events would seem to be to fill the buffer first, _then_ try to read from it. However, in this case, if a single fill of the buffer brought in more than one message, before getting that second message out of the buffer, we would be trying to read from the `TcpStream` first. Even if there were data immediately available, this would still take much longer and delay that second message unnecessarily. (If more data _weren't_ immediately available to read from the `TcpStream`, we might be `.await`ing quite some time before that second message gets out of the buffer). This way, this function will return all complete messages in the buffer before it tries to read in more bytes.
+
+### Our Write Strategy
+
+This is much easier, because it doesn't have to be cancellation-safe,[^write-cancel] although it almost is, and it'd be easy to make it so. We only have three types of `ServerMessage`s; the `Heartbeat` is only a single byte, and the `Error` will only get sent at most one time per connection. The one we need to pay attention to is the `Ticket`; it's the most involved of all the messages, they may end up getting sent in rapid succession, and it's essentially where the rubber meets the road[^auto-analogy]; the Protohackers test server is largely going to be judging us on whether we dispatch the appropriate tickets. For the `Ticket` variant, we will write the entire thing to an internal buffer, then write the whole thing to the underlying stream with a single `async` write; making repeated small writes to the `TcpStream` would take longer and involve a lot more `.await`ing (and possible task switching) than necessary.
+
+[^write-cancel]: We're not going to be `select!`ing on writes.
+
+[^auto-analogy]: Automotive analogy incidental.
+
+```rust
+impl IOPair {
+
+    /* ... snip ... */
+
+    // Writes each of the various types of ServerMessage to the underlying
+    // TcpStream. The only reason this function is wrapped is to convert
+    // the error type.
+    //
+    // In the case of the ServerMessage::Ticket, in order to prevent
+    // repeated async writes to the underlying TcpStream, we first
+    // buffer the output and then write the buffer all at once.
+    async fn inner_write(&mut self, smesg: ServerMessage) -> Result<(), io::Error> {
+        use tokio::io::AsyncWriteExt;
+
+        match smesg {
+            ServerMessage::Heartbeat => {
+                self.writer.write_all(&[0x41]).await?;
+            }
+
+            ServerMessage::Error { msg } => {
+                // msg.length was originally cast _from_ a u8, so this should
+                // always succeed.
+                let len_byte: u8 = msg.length.try_into().unwrap();
+                // Sending this message involves two separate writes. Were
+                // we sending a lot of these, we'd probably buffer this data
+                // and just make one; as it is, this is always going to be the
+                // last message we'll send before hanging up on a client, so
+                // we won't bother.
+                self.writer.write_all(&[0x10, len_byte]).await?;
+                self.writer.write_all(msg.as_slice()).await?;
+            }
+
+            ServerMessage::Ticket {
+                plate,
+                road,
+                mile1,
+                timestamp1,
+                mile2,
+                timestamp2,
+                speed,
+            } => {
+                let mut c = Cursor::new([0u8; IO_BUFF_SIZE]);
+                // plate.length was originally cast _from_ a u8, so this
+                // should always succeed.
+                let len_byte: u8 = plate.length.try_into().unwrap();
+
+                c.write_all(&[0x21, len_byte])?;
+                c.write_all(plate.as_slice())?;
+                c.write_all(&road.to_be_bytes())?;
+                c.write_all(&mile1.to_be_bytes())?;
+                c.write_all(&timestamp1.to_be_bytes())?;
+                c.write_all(&mile2.to_be_bytes())?;
+                c.write_all(&timestamp2.to_be_bytes())?;
+                c.write_all(&speed.to_be_bytes())?;
+
+                // For some reason Cursor::position() returns a u64 and
+                // not a usize. In any case, this should always be less
+                // than IO_BUFF_SIZE and thus fit into a usize, regardless
+                // of target platform.
+                let length: usize = c.position().try_into().unwrap();
+                let buff = c.into_inner();
+                self.writer.write_all(&buff[..length]).await?;
+            }
+        }
+
+        self.writer.flush().await
+    }
+
+    /// Send a ServerMessage to the connected client.
+    pub async fn write(&mut self, smesg: ServerMessage) -> Result<(), Error> {
+        self.inner_write(smesg).await.map_err(Error::IOError)
+    }
+}
+```
+
+Like the reading operation, the meat of the writing operation happens in a wrapped function, although this time it's only to convert the error type conveniently.
+
+We complete our `IOError` implementation with a method to cleanly shut down the underlying `TcpStream`. This method consumes it, both because it requires taking ownership of the `.reader` and `.writer` members, and also because there's no use in keeping the `IOError` around after its underlying socket has been shut down.
+
+```rust
+impl IOPair {
+
+    /* ... snip ... */
+
+    /// Shuts down the underlying socket so it can be dropped gracefully.
+    ///
+    /// This consumes the IOPair, as it's useless once the socket is closed.
+    pub async fn shutdown(self) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut sock = self.reader.unsplit(self.writer);
+        sock.shutdown().await.map_err(Error::IOError)
+    }
+}
+```
+
+## To Be Continued
+
+That's everything we need to handle the specific exchange of bytes through the tubes to our client devices. In the series's next post, we'll go over storing observations, and then overall architecture; in a later post (or posts), we'll then get into the details of the buisness logic.
