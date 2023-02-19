@@ -8,6 +8,9 @@ use tracing::{event, Level};
 use crate::bio::LPString;
 
 /// A struct so we don't get our timestamps and our days confused.
+///
+/// We need to derive all these traits because we're going to be storing
+/// them in a BTreeSet.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Day(u32);
 
@@ -21,6 +24,9 @@ pub struct Obs {
 impl Obs {
     /// Determing the average speed between two observations
     /// in miles per hour x100.
+    ///
+    /// Obviously, it only makes sense to use this to compare two observations
+    /// of the same vehicle on the same road.
     pub fn speed_between(&self, other: &Obs) -> u16 {
         // I'm just going to arbitrarily return 0 here to avoid division
         // by zero.
@@ -71,10 +77,12 @@ pub struct Infraction {
     pub road: u16,
     pub start: Obs,
     pub end: Obs,
+    /// In hundredths of miles per hour.
     pub speed: u16,
 }
 
 /// Stores a record of observations and issued tickets.
+#[derive(Debug)]
 pub struct Car {
     plate: LPString,
     observations: BTreeMap<u16, Vec<Obs>>,
@@ -82,6 +90,7 @@ pub struct Car {
 }
 
 impl Car {
+    /// Instantiate a new car with the given plate and observation parameters.
     pub fn new(plate: LPString, road: u16, obs: Obs) -> Car {
         let mut observations = BTreeMap::new();
         observations.insert(road, vec![obs]);
@@ -129,7 +138,22 @@ impl Car {
                             end: prev,
                         }
                     };
-                    self.set_ticketed(&ticket);
+
+                    // We're going to issue a ticket for this vehicle, and
+                    // don't want to issue another one for the day (or days)
+                    // of the observations for this one.
+                    self.ticketed.insert(ticket.start.day());
+                    // Inserting into a BTreeSet is idempotent, so it doesn't
+                    // matter if the start and end days are the same.
+                    self.ticketed.insert(ticket.end.day());
+                    // Remove all records of observations on ticketed days.
+                    // These observations can't be used to generate more
+                    // tickets, and it'll reduce the amount of checking
+                    // we'll have to do on future insertions.
+                    for (_, obs_v) in self.observations.iter_mut() {
+                        obs_v.retain(|o| !self.ticketed.contains(&o.day()));
+                    }
+
                     return Some(ticket);
                 }
             }
@@ -139,20 +163,6 @@ impl Car {
         }
 
         None
-    }
-
-    /// Record that this vehicle was ticketed on the given day(s) of
-    /// the given Infraction.
-    ///
-    /// Also removes any observations from days on which the vehicle has
-    /// been ticketed; they are no longer of use.
-    fn set_ticketed(&mut self, i: &Infraction) {
-        self.ticketed.insert(i.start.day());
-        // If both days are the same, this is a no-op for a BTreeSet.
-        self.ticketed.insert(i.end.day());
-        for (_, obs_v) in self.observations.iter_mut() {
-            obs_v.retain(|o| !self.ticketed.contains(&o.day()));
-        }
     }
 }
 
