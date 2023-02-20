@@ -358,6 +358,22 @@ impl IOPair {
 
 We wrap a `Cursor` around the part of our buffer that contains data, and use our added trait methods to read from that. If the `Cursor` hits the end of the data before reading a whole message, it will return a `std::io::Error` of `ErrorKind::UnexpectedEof`; this will signal to our async read method that we need to read more bytes into the buffer.
 
+Before we get to our `.read()` method, let's introduce our error type, which unifies several types of erroneous situation. It'll be an _enum_, though, so it'll also allow callers to distinguish between those situations if they want.
+
+```rust
+/// A unifying error type to make error handling a little easier.
+#[derive(Debug)]
+pub enum Error {
+    /// The connected client has disconnected cleanly.
+    Eof,
+    /// The connected client has written some sort of message that doesn't conform
+    /// to the protocol.
+    ProtocolError(String),
+    /// There was an actual OS-level read/write error.
+    IOError(std::io::Error),
+}
+```
+
 This brings us to the meat of this module, the `IOPair::read()` method, our `async` method for reading `ClientMessages` on which we can safely `select!`. It starts by first calling the method we just wrote, trying to read a message from the internal buffer. If successful, it will return that message, but not before moving any unread data to the beginning of the buffer and repositioning the buffer's write pointer appropriately. If it _can't_ read a complete `ClientMessage` from the buffer (that is, if `.inner_read()` returns with an `ErrorKind::UnexpectedEof`), it reads some more bytes from the `TcpStream` into the buffer. If this read successfully returns 0 bytes, this either means that the internal buffer is full (the client has exceeded the maximum valid message size without sending a valid message), or that the client has disconnected; in either case, we're done and should hang up. Otherwise, we loop back around and try to read from the internal buffer again. If we encounter a non-fatal error (a `WouldBlock` or `Interrupted`), we'll [yield](https://docs.rs/tokio/latest/tokio/task/fn.yield_now.html), letting some other tasks run before trying again; on any legit error, we'll bail.
 
 ```rust

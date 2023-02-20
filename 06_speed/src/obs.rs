@@ -85,6 +85,7 @@ pub struct Infraction {
 #[derive(Debug)]
 pub struct Car {
     plate: LPString,
+    /// Keys are road numbers; values are vectors of observations.
     observations: BTreeMap<u16, Vec<Obs>>,
     ticketed: BTreeSet<Day>,
 }

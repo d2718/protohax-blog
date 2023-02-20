@@ -1,6 +1,6 @@
 title: Protohackers in Rust, Part 06 (b)
 subtitle: Observations and Architecture
-time: 2023-02-18 16:05:00
+time: 2023-02-20 13:08:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the seventh Protohackers problem
 mathjax: true
@@ -19,7 +19,7 @@ This post itself is the second in a _subseries_ on solving [The Seventh Problem]
 
 The pseudoreal goal of this exercise is to determine when vehicles have committed speeding violations, whether a vehicle should be ticketed for any given infraction, and if so, to send the information about that infraction to a ticket dispatcher client that has responsibility for the road on which the violation took place. We must make these decisions from reports that come from camera clients.
 
-Each camera sends messages with licence plates and the timestamps of when the vehicle with said plate passed the given camera's position on its given road. Each data point is essentially (plate, road, position, time). Any time two of these observations show the same vehicle on the same road such that the $\frac{\delta x}{\delta t}$ between them is greater than the speed limit on that road, we know by the [mean value theorem](https://en.wikipedia.org/wiki/Mean_value_theorem) that the vehicle has exceeded the speed limit at some point.
+Each camera sends messages with licence plates and the timestamps of when the vehicle with said plate passed the given camera's position on its given road. Each data point is essentially `(plate, road, position, time)`. Any time two of these observations show the same vehicle on the same road such that the $\frac{\Delta x}{\Delta t}$ between them is greater than the speed limit on that road, we know by the [mean value theorem](https://en.wikipedia.org/wiki/Mean_value_theorem) that the vehicle has exceeded the speed limit at some point.
 
 We will maintain a set of `Car` structs, indexed by license plate.[^plate-indexed] Each `Car` will maintain a set of vectors of observations, indexed by road. Each time an observation comes in, we'll check it against all other observations of that vehicle on the same road to see if any are far apart enough in space and close together enough in time to warrant an infraction. If the vehicle has not already been earned an infraction for that day,[^day-days] we will issue one.
 
@@ -48,7 +48,8 @@ The first thing we'll do is create a [newtype struct](https://rust-unofficial.gi
 /// A struct so we don't get our timestamps and our days confused.
 ///
 /// We need to derive all these traits because we're going to be storing
-/// them in a BTreeSet.#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+/// them in a BTreeSet.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Day(u32);
 ```
 
@@ -149,6 +150,7 @@ And here is our `Car` struct.[^car-vehicle] It has a `BTreeMap` of observations 
 #[derive(Debug)]
 pub struct Car {
     plate: LPString,
+    /// Keys are road numbers; values are vectors of observations.
     observations: BTreeMap<u16, Vec<Obs>>,
     ticketed: BTreeSet<Day>,
 }
@@ -251,48 +253,100 @@ As in the prior [Budget Chat](https://d2718.net/blog/posts/protohax_03.html) pro
 
 [^not-messages]: Although we will not use `bio::ClientMessage` for this.
 
+As before, having a single task manage all the state and communicate via channels allows us to not have to worry about locking or ownership or passing references between tasks or threads.[^golang]
+
+[^golang]: I'm not a _huge_ fan of Golang (obviously, I much prefer Rust, and I prefer it even for domains firmly in Go's wheelhouse), but I do think this is one place where the Go team really hit the mark: Go strongly encourages structuring one's application as a group of cooperating tasks communicating via channels. It's an elegant, satisfying design pattern.
+
 Let's do some more ASCII art.
 
-┌─────────────────────────┐                          ┌──────────────┐
-│                         │                          │ Unidentified │
-│        Main Task        │                          │              │
-│        ---------        │                          │    Client    │
-│                         │                          └──────────────┘
-│  stores observations    │
-│                         │                          ┌──────────────┐
-│  makes decisions about  │                          │ Unidentified │
-│  issuing infractions    │                          │              │
-│                         │                          │    Client    │
-│                         │                          └──────────────┘
-│                         │
-│                         │                          ... (add'l unidentified) ...
-│                         │
-│                         │
-│                         │                          ┌──────────────┐
-│                         │                          │    Camera    │
-│                         │                          │              │
-│                         │                          │    Client    │
-│                         │                          └──────────────┘
-│                         │
-│                         │                          ┌──────────────┐
-│                         │                          │    Camera    │
-│                         │                          │              │
-│                         │                          │    Client    │
-│                         │                          └──────────────┘
-│                         │
-│                         │                          ... (add'l cameras) ...
-│                         │
-│                         │
-│                         │                          ┌──────────────┐
-│                         │                          │  Dispatcher  │
-│                         │                          │              │
-│                         │                          │    Client    │
-│                         │                          └──────────────┘
-│                         │
-│                         │                          ┌──────────────┐
-│                         │                          │  Dispatcher  │
-│                         │                          │              │
-│                         │                          │    Client    │
-└─────────────────────────┘                          └──────────────┘
+```
+┌-----------------------┐                        ┌--------------┐
+|                       |                  +--<--| Unidentified |ReadHalf--<┐
+|                       |                  |     |              |           |===| TcpStream |===
+|                       |-->--| mpsc |-->--|-->--|    Client    |WriteHalf->┘
+|                       |                  |     └--------------┘
+|                       |                  V
+|                       |                  |     ┌--------------┐
+|                       |                  +--<--| Unidentified |ReadHalf--<┐
+|                       |                  |     |              |           |===| TcpStream |===
+|                       |-->--| mpsc |-->--|-->--|    Client    |WriteHalf->┘
+|                       |                  |     └--------------┘
+|                       |                  |
+|                       |                  /            etc...
+|                       |
+|                       |                  /
+|                       |                  |     ┌--------------┐
+|                       |                  +--<--|    Camera    |ReadHalf--<┐
+|       Main Task       |                  |     |              |           |===| TcpStream |===
+|       ---------       |                  V     |    Client    |WriteHalf->┘
+|                       |                  |     └--------------┘
+| stores observations   |--<--| mpsc |--<--+
+|                       |     (Events)     |     ┌--------------┐
+| makes decisions about |                  +--<--|    Camera    |ReadHalf--<┐
+| issuing infractions   |                  |     |              |           |===| TcpStream |===
+|                       |                  |     |    Client    |WriteHalf->┘
+|                       |                  A     └--------------┘
+|                       |                  |
+|                       |                  /            etc...
+|                       |
+|                       |                  /
+|                       |                  |     ┌--------------┐
+|                       |                  +--<--|  Dispatcher  |ReadHalf--<┐
+|                       |                  |     |              |           |===| TcpStream |===
+|                       |-->--| mpsc |-->--|-->--|    Client    |WriteHalf->┘
+|                       |  (Infractions)   |     └--------------┘
+|                       |                  A
+|                       |                  |     ┌--------------┐
+|                       |                  +--<--|  Dispatcher  |ReadHalf--<┐
+|                       |                  |     |              |           |===| TcpStream |===
+|                       |-->--| mpsc |-->--|-->--|    Client    |WriteHalf->┘
+|                       |  (Infractions)   |     └--------------┘
+|                       |                  |
+/                       /                  A            etc...
+                                           |
+/                       /                  /
+|                       |
+└-----------------------┘
+```
 
-                                                     ... (add'l dispatchers) ...
+The only information that needs to be communicated _from_ the main task _to_ the clients is ticket information to dispatcher clients, so the `mpsc` channels flowing that direction will carry the `obs::Infraction` type. The pieces of information that needs to be communicated _to_ the main task are:
+
+  * a client becoming a camera or a dispatcher
+  * a client disconnecting
+  * vehicular observations
+
+We thus define an `Event` type, to be carried by the channel flowing back to the main task from the client tasks.
+
+The entirety of `src/events.rs`:
+
+```rust
+/*!
+The types of messages that can be sent from a client task to the central
+server task.
+*/
+use crate::{
+    bio::{LPString, LPU16Array},
+    obs::Obs,
+};
+
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// The client with the given id is a camera.
+    Camera { id: usize },
+    /// The client with the given id is a dispatcher in charge of the
+    /// given roads.
+    Dispatcher { id: usize, roads: LPU16Array },
+    /// The client with the given id has disconnected.
+    Gone { id: usize },
+    /// The given car was observed on the given road at the given
+    /// pos coordinates.
+    Observation {
+        plate: LPString,
+        road: u16,
+        limit: u16,
+        pos: Obs,
+    },
+}
+```
+
+So now we have our plan. Client tasks will communicate with connected devices using the types in the `obs` module, and pass the required information through a channel to the main task. The main task will store all the state, decide when to issue tickets, and communicate those details to the client tasks managing the appropriate dispatchers. Next time we'll start with slogging through the nitty-gritty of the client-handling implementation.

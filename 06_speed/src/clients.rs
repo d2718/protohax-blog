@@ -16,6 +16,10 @@ use crate::{
     obs::{Infraction, Obs},
 };
 
+/// Error message with which we'll panic if any of the client tasks find the
+/// channel to the main task closed. This should never happen, and if it does,
+/// the program can't do any more work anyway, so it's totally reasonable
+/// to just die.
 static CHANNEL_CLOSED: &str = "main channel closed";
 
 /// A struct to provide an optional heartbeat.
@@ -43,6 +47,7 @@ impl Heartbeat {
         let millis: u64 = (n as u64) * 100;
         let period = Duration::from_millis(millis);
         self.0 = Some(interval_at(
+            // Set it to start exactly one period from now.
             Instant::now().checked_add(period).unwrap(),
             period,
         ));
@@ -71,7 +76,9 @@ pub struct Client {
     id: usize,
     heart: Heartbeat,
     socket: IOPair,
+    /// Channel to the main task.
     tx: UnboundedSender<Event>,
+    /// Channel from the main task.
     rx: Receiver<Infraction>,
 }
 
@@ -91,17 +98,26 @@ impl Client {
         }
     }
 
+    async fn try_start_heart(&mut self, interval: u32) -> Result<(), Error> {
+        if self.heart.is_beating() {
+            let msg = ServerMessage::Error{
+                msg: LPString::from(
+                    &"multiple heartbeat requests"
+                )
+            };
+            self.socket.write(msg).await?;
+            return Err(Error::ProtocolError(
+                "multiple heartbeat requests".into()
+            ));
+        } else {
+            self.heart.set_decisecs(interval);
+            Ok(())
+        }
+    }
+
     async fn wrapped_run(&mut self) -> Result<(), Error> {
         loop {
             tokio::select! {
-                // We are running a biased select because we want to
-                // prioritize sending a Heartbeat if one's due.
-                biased;
-
-                _ = self.heart.beat() => {
-                    self.socket.write(ServerMessage::Heartbeat).await?;
-                },
-
                 msg = self.socket.read() => {
                     event!(Level::TRACE, "client {} message: {:?}", &self.id, &msg);
                     match msg? {
@@ -127,19 +143,7 @@ impl Client {
                         },
 
                         ClientMessage::WantHeartbeat{ interval } => {
-                            if self.heart.is_beating() {
-                                let msg = ServerMessage::Error{
-                                    msg: LPString::from(
-                                        &"multiple heartbeat requests"
-                                    )
-                                };
-                                self.socket.write(msg).await?;
-                                return Err(Error::ProtocolError(
-                                    "multiple heartbeat requests".into()
-                                ));
-                            } else {
-                                self.heart.set_decisecs(interval);
-                            }
+                            self.try_start_heart(interval).await?
                         },
 
                         msg => {
@@ -154,6 +158,10 @@ impl Client {
                             )));
                         },
                     }
+                },
+
+                _ = self.heart.beat() => {
+                    self.socket.write(ServerMessage::Heartbeat).await?;
                 },
             }
         }
@@ -215,19 +223,7 @@ impl Client {
                         },
 
                         ClientMessage::WantHeartbeat{ interval } => {
-                            if self.heart.is_beating() {
-                                let errmsg = ServerMessage::Error{
-                                    msg: LPString::from(
-                                        &"multiple heartbeat requests"
-                                    )
-                                };
-                                self.socket.write(errmsg).await?;
-                                return Err(Error::ProtocolError(
-                                    "multiple heartbeat requests".into()
-                                ));
-                            } else {
-                                self.heart.set_decisecs(interval);
-                            }
+                            self.try_start_heart(interval).await?
                         },
 
                         msg => {
@@ -259,19 +255,7 @@ impl Client {
                     event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
                     match msg? {
                         ClientMessage::WantHeartbeat{ interval } => {
-                            if self.heart.is_beating() {
-                                let errmsg = ServerMessage::Error{
-                                    msg: LPString::from(
-                                        &"multiple heartbeat requests"
-                                    )
-                                };
-                                self.socket.write(errmsg).await?;
-                                return Err(Error::ProtocolError(
-                                    "multiple heartbeat requests".into()
-                                ));
-                            } else {
-                                self.heart.set_decisecs(interval);
-                            }
+                            self.try_start_heart(interval).await?
                         },
 
                         msg => {
