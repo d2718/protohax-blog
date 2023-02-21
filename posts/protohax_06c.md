@@ -1,5 +1,5 @@
 title: Protohackers in Rust, Part 06 (c)
-subtitle: 
+subtitle: The Client
 time: 2023-02-20 13:08:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the seventh Protohackers problem
@@ -19,7 +19,7 @@ This post itself is the third in a _subseries_ on solving [The Seventh Problem](
 
 Here's a thorny detail of our client tasks' operation: At any point, a connected device can request that we supply it with a "heartbeat" message at regular intervals, in addition to the business of reading and writing the data that's part of the client's usual operation. Let's work that out.
 
-Our client task will, naturally, be looping over a `select!` statement; sometimes that `select!` needs to have something that resolves at regular intervals, and sometimes it doesn't. So we'll define a struct that contains just an `Option<[tokio::time::Interval](https://docs.rs/tokio/latest/tokio/time/fn.interval.html)>`; the `Interval` is a type that has an `async` method whose return type resolves at regular intervals. Here's an example:
+Our client task will, naturally, be looping over a `select!` statement; sometimes that `select!` needs to have something that resolves at regular intervals, and sometimes it doesn't. So we'll define a struct that contains just an [`Option<tokio::time::Interval>`](https://docs.rs/tokio/latest/tokio/time/fn.interval.html); the `Interval` is a type that has an `async` method whose return type resolves at regular intervals. Here's an example:
 
 ```rust
 use std::time::Duration()
@@ -288,12 +288,6 @@ impl Client {
 
                         ClientMessage::WantHeartbeat{ interval } => {
                             if self.heart.is_beating() {
-                                let msg = ServerMessage::Error{
-                                    msg: LPString::from(
-                                        &"multiple heartbeat requests"
-                                    )
-                                };
-                                self.socket.write(msg).await?;
                                 return Err(Error::ProtocolError(
                                     "multiple heartbeat requests".into()
                                 ));
@@ -303,14 +297,8 @@ impl Client {
                         },
 
                         msg => {
-                            let errmsg = ServerMessage::Error{
-                                msg: LPString::from(
-                                    &"client not identified yet"
-                                )
-                            };
-                            self.socket.write(errmsg).await?;
                             return Err(Error::ProtocolError(format!(
-                                "sent {:?} without identifying", &msg
+                                "illegal unident msg: {:?} ", &msg
                             )));
                         },
                     }
@@ -322,7 +310,6 @@ impl Client {
             }
         }
     }
-}
 ```
 
 We see from this what the signature of our `.run_as_camera()` method needs: the camera client's road, mile marker, and that road's speed limit. So let's bang out that one next.
@@ -333,10 +320,10 @@ impl Client {
     /* ... snip ... */
 
     async fn run_as_camera(
-        &mut self,
-        road: u16,
-        mile: u16,
-        limit: u16
+      &mut self,
+      road: u16,
+      mile: u16,
+      limit: u16
     ) -> Result<(), Error> {
         // Don't need this anymore.
         self.rx.close();
@@ -357,12 +344,6 @@ impl Client {
 
                         ClientMessage::WantHeartbeat{ interval } => {
                             if self.heart.is_beating() {
-                                let errmsg = ServerMessage::Error{
-                                    msg: LPString::from(
-                                        &"multiple heartbeat requests"
-                                    )
-                                };
-                                self.socket.write(errmsg).await?;
                                 return Err(Error::ProtocolError(
                                     "multiple heartbeat requests".into()
                                 ));
@@ -372,14 +353,8 @@ impl Client {
                         },
 
                         msg => {
-                            let errmsg = ServerMessage::Error{
-                                msg: LPString::from(
-                                    &"illegal Camera message"
-                                )
-                            };
-                            self.socket.write(errmsg).await?;
                             return Err(Error::ProtocolError(
-                                format!("Camera sent {:?}", &msg)
+                                format!("illegal Camera msg: {:?}", &msg)
                             ));
                         },
                     }
@@ -410,12 +385,6 @@ impl Client {
                     match msg? {
                         ClientMessage::WantHeartbeat{ interval } => {
                             if self.heart.is_beating() {
-                                let errmsg = ServerMessage::Error{
-                                    msg: LPString::from(
-                                        &"multiple heartbeat requests"
-                                    )
-                                };
-                                self.socket.write(errmsg).await?;
                                 return Err(Error::ProtocolError(
                                     "multiple heartbeat requests".into()
                                 ));
@@ -426,7 +395,7 @@ impl Client {
 
                         msg => {
                             return Err(Error::ProtocolError(
-                                format!("illegal msg: {:?}", &msg)
+                                format!("illegal Dispatcher msg: {:?}", &msg)
                             ));
                         },
                     }
@@ -479,12 +448,6 @@ impl Client {
 
     async fn try_start_heart(&mut self, interval: u32) -> Result<(), Error> {
         if self.heart.is_beating() {
-            let msg = ServerMessage::Error{
-                msg: LPString::from(
-                    &"multiple heartbeat requests"
-                )
-            };
-            self.socket.write(msg).await?;
             return Err(Error::ProtocolError(
                 "multiple heartbeat requests".into()
             ));
@@ -508,3 +471,67 @@ And now each of the `WantHeartbeat` match arms looks like
 ```
 
 Which is much more concise.
+
+You can see also now why our channels from the main task to the client tasks carry a special type (`obs::Infraction`) and not just `ServerMessage::Ticket` variants. In the latter case the client tasks would have to match on the received value, and we'd have to make a decision about what we wanted to do about variants of `ServerMessage` that _weren't_ `Ticket`. By using the `Infraction` type, we avoid noise at the `.recv()` site[^decision-fatigue] and also make it impossible to screw up when writing our main task by sending the wrong type of message.[^screwup]
+
+[^decision-fatigue]: And are also freed from making decisions about what to do with invalid message variants.
+
+[^screwup]: We can still obviously screw it up plenty of other ways, but let's go ahead and count this particular blessing here.
+
+So now the outer `.run()` method. It'll take `mut self` and consume the `Client` struct; obviously we won't need it anymore after it's done running. Also, this will allow us to move the `IOPair` into its own self-consuming `.shutdown()` method at the end. We'll run our `.wrapped_run()` method, and we'll react differently based on the returned `Error` variant[^inevitable]
+
+  * `Error::Eof` means that the client disconnected cleanly, so we won't generate any error messages.
+  * `Error::IOError` means that we encountered an actual read/write error. We'll log it and inform the connected device that we screwed up.
+  * `Error::ProtocolError` means the connected device sent us some invalid data or otherwise didn't adhere to the protocol; we let them know it was their fault.
+
+Then we'll close the socket and let the main task know the device has disconnected.
+
+[^inevitable]: You may have noticed that it will always return an `Err`. There are no breaks out of the loop or `Ok(())` returns. We could have written this function (and the other run functions that it wraps) to just return our own `RunResult` enum type or something, but then we wouldn't have gotten the convenience and concision that comes with using `?` on `Result`s.
+
+```rust
+impl Client {
+
+    /* ... snip ... */
+
+    pub async fn run(mut self) {
+        span!(Level::TRACE, "run", client = &self.id);
+
+        if let Err(e) = self.wrapped_run().await {
+            match e {
+                Error::Eof => { /* clean */ }
+                Error::IOError(_) => {
+                    event!(Level::ERROR, "client {}: {:?}", &self.id, &e);
+                    let msg = ServerMessage::Error {
+                        msg: LPString::from(&"the server encountered an error"),
+                    };
+                    let _ = self.socket.write(msg).await;
+                }
+                Error::ProtocolError(cerr) => {
+                    event!(Level::ERROR, "client {} error: {}", &self.id, &cerr);
+                    let msg = ServerMessage::Error {
+                        msg: LPString::from(&cerr),
+                    };
+                    let _ = self.socket.write(msg).await;
+                }
+            }
+        }
+
+        if let Err(e) = self.socket.shutdown().await {
+            event!(
+                Level::ERROR,
+                "client {}: error shutting down socket: {:?}",
+                &self.id,
+                &e
+            );
+        }
+        if let Err(e) = self.tx.send(Event::Gone { id: self.id }) {
+            event!(Level::ERROR, "error sending Gone({}): {:?}", &self.id, &e);
+        }
+        event!(Level::TRACE, "client {} disconnects", &self.id);
+    }
+}
+```
+
+## One More Episode
+
+We have now specified the workings of our client tasks. Next time, in the final post about Problem 6, we'll write our main task. Now that we have everything else written, we should have a pretty coherent idea of what needs to happen, and the process should be pretty straightforward.

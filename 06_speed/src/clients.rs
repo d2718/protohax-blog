@@ -100,12 +100,6 @@ impl Client {
 
     async fn try_start_heart(&mut self, interval: u32) -> Result<(), Error> {
         if self.heart.is_beating() {
-            let msg = ServerMessage::Error{
-                msg: LPString::from(
-                    &"multiple heartbeat requests"
-                )
-            };
-            self.socket.write(msg).await?;
             return Err(Error::ProtocolError(
                 "multiple heartbeat requests".into()
             ));
@@ -147,14 +141,8 @@ impl Client {
                         },
 
                         msg => {
-                            let errmsg = ServerMessage::Error{
-                                msg: LPString::from(
-                                    &"client not identified yet"
-                                )
-                            };
-                            self.socket.write(errmsg).await?;
                             return Err(Error::ProtocolError(format!(
-                                "sent {:?} without identifying", &msg
+                                "illegal unident msg: {:?} ", &msg
                             )));
                         },
                     }
@@ -163,6 +151,97 @@ impl Client {
                 _ = self.heart.beat() => {
                     self.socket.write(ServerMessage::Heartbeat).await?;
                 },
+            }
+        }
+    }
+
+    async fn run_as_camera(&mut self, road: u16, mile: u16, limit: u16) -> Result<(), Error> {
+        // Don't need this anymore.
+        self.rx.close();
+
+        span!(Level::TRACE, "running as Camera", client = self.id);
+        loop {
+            tokio::select! {
+                msg = self.socket.read() => {
+                    event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
+                    match msg? {
+                        ClientMessage::Plate{ plate, timestamp } => {
+                            let pos = Obs{ mile, timestamp};
+                            let evt = Event::Observation{
+                                plate, road, limit, pos
+                            };
+                            self.tx.send(evt).expect(CHANNEL_CLOSED);
+                        },
+
+                        ClientMessage::WantHeartbeat{ interval } => {
+                            self.try_start_heart(interval).await?
+                        },
+
+                        msg => {
+                            return Err(Error::ProtocolError(
+                                format!("illegal Camera msg: {:?}", &msg)
+                            ));
+                        },
+                    }
+                },
+
+                _ = self.heart.beat() => {
+                    self.socket.write(ServerMessage::Heartbeat).await?;
+                }
+            }
+        }
+    }
+
+    async fn run_as_dispatcher(&mut self) -> Result<(), Error> {
+        span!(Level::TRACE, "running as Dispatcher", client = self.id);
+        loop {
+            tokio::select! {
+                msg = self.socket.read() => {
+                    event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
+                    match msg? {
+                        ClientMessage::WantHeartbeat{ interval } => {
+                            self.try_start_heart(interval).await?
+                        },
+
+                        msg => {
+                            return Err(Error::ProtocolError(
+                                format!("illegal Dispatcher msg: {:?}", &msg)
+                            ));
+                        },
+                    }
+                },
+
+                msg = self.rx.recv() => {
+                    event!(Level::TRACE,
+                        "client {} recv'd: {:?}", &self.id, &msg
+                    );
+                    match msg {
+                        Some(Infraction{ plate, road, start, end, speed }) => {
+                            let msg = ServerMessage::Ticket{
+                                plate, road, speed,
+                                mile1: start.mile,
+                                timestamp1: start.timestamp,
+                                mile2: end.mile,
+                                timestamp2: end.timestamp,
+                            };
+                            self.socket.write(msg).await?;
+                            event!(Level::DEBUG,
+                                "client {} wrote Infraction for {:?}", &self.id, &plate
+                            );
+                        },
+
+                        None => {
+                            event!(Level::ERROR, "Dispatcher {} channel closed", &self.id);
+                            let msg = ServerMessage::Error {
+                                msg: LPString::from(
+                                    &"server error, sorry"
+                                )
+                            };
+                            self.socket.write(msg).await?;
+                            return Ok(());
+                        }
+                    }
+                }
             }
         }
     }
@@ -202,102 +281,5 @@ impl Client {
             event!(Level::ERROR, "error sending Gone({}): {:?}", &self.id, &e);
         }
         event!(Level::TRACE, "client {} disconnects", &self.id);
-    }
-
-    async fn run_as_camera(&mut self, road: u16, mile: u16, limit: u16) -> Result<(), Error> {
-        // Don't need this anymore.
-        self.rx.close();
-
-        span!(Level::TRACE, "running as Camera", client = self.id);
-        loop {
-            tokio::select! {
-                msg = self.socket.read() => {
-                    event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
-                    match msg? {
-                        ClientMessage::Plate{ plate, timestamp } => {
-                            let pos = Obs{ mile, timestamp};
-                            let evt = Event::Observation{
-                                plate, road, limit, pos
-                            };
-                            self.tx.send(evt).expect(CHANNEL_CLOSED);
-                        },
-
-                        ClientMessage::WantHeartbeat{ interval } => {
-                            self.try_start_heart(interval).await?
-                        },
-
-                        msg => {
-                            let errmsg = ServerMessage::Error{
-                                msg: LPString::from(
-                                    &"illegal Camera message"
-                                )
-                            };
-                            self.socket.write(errmsg).await?;
-                            return Err(Error::ProtocolError(
-                                format!("Camera sent {:?}", &msg)
-                            ));
-                        },
-                    }
-                },
-
-                _ = self.heart.beat() => {
-                    self.socket.write(ServerMessage::Heartbeat).await?;
-                }
-            }
-        }
-    }
-
-    async fn run_as_dispatcher(&mut self) -> Result<(), Error> {
-        span!(Level::TRACE, "running as Dispatcher", client = self.id);
-        loop {
-            tokio::select! {
-                msg = self.socket.read() => {
-                    event!(Level::TRACE, "client {} message {:?}", &self.id, &msg);
-                    match msg? {
-                        ClientMessage::WantHeartbeat{ interval } => {
-                            self.try_start_heart(interval).await?
-                        },
-
-                        msg => {
-                            return Err(Error::ProtocolError(
-                                format!("illegal msg: {:?}", &msg)
-                            ));
-                        },
-                    }
-                },
-
-                msg = self.rx.recv() => {
-                    event!(Level::TRACE,
-                        "client {} recv'd: {:?}", &self.id, &msg
-                    );
-                    match msg {
-                        Some(Infraction{ plate, road, start, end, speed }) => {
-                            let msg = ServerMessage::Ticket{
-                                plate, road, speed,
-                                mile1: start.mile,
-                                timestamp1: start.timestamp,
-                                mile2: end.mile,
-                                timestamp2: end.timestamp,
-                            };
-                            self.socket.write(msg).await?;
-                            event!(Level::DEBUG,
-                                "client {} wrote Infraction for {:?}", &self.id, &plate
-                            );
-                        },
-
-                        None => {
-                            event!(Level::ERROR, "Dispatcher {} channel closed", &self.id);
-                            let msg = ServerMessage::Error {
-                                msg: LPString::from(
-                                    &"server error, sorry"
-                                )
-                            };
-                            self.socket.write(msg).await?;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
     }
 }
