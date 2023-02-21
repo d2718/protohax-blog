@@ -1,6 +1,6 @@
 title: Protohackers in Rust, Part 06 (b)
 subtitle: Observations and Architecture
-time: 2023-02-21 10:55:00
+time: 2023-02-19 10:55:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the seventh Protohackers problem
 mathjax: true
