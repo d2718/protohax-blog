@@ -72,12 +72,16 @@ fn remove_roads(coverage: &mut BTreeMap<u16, Vec<usize>>, id: usize, d: Dispatch
         let mut empty_vec = false;
         if let Some(v) = coverage.get_mut(road) {
             if let Some(i) = v.iter().position(|&oid| oid == id) {
+                // The order of dispatcher ids in each Vec doesn't matter, and
+                // Vec::remove() is O(n), while this is O(1).
                 v.swap_remove(i);
                 if v.is_empty() {
                     empty_vec = true;
                 }
             }
         }
+        // If there are no more connected dispatchers with responsibility for
+        // this road, just go ahead and remove the whole thing from the map.
         if empty_vec {
             coverage.remove(road);
         }
@@ -112,14 +116,39 @@ async fn main() {
     );
 
     let mut client_n: usize = 0;
-    let mut n_connected: usize = 0;
     loop {
         tokio::select! {
+            res = listener.accept() => match res {
+                Ok((stream, addr)) => {
+                    event!(Level::DEBUG,
+                        "accpted client {} from {:?}", &client_n, &addr
+                    );
+                    let (out_tx, out_rx) = mpsc::channel::<Infraction>(CHAN_SIZE);
+                    let client = Client::new(
+                        client_n, stream, tx.clone(), out_rx
+                    );
+                    unid_clients.insert(client_n, out_tx);
+                    tokio::spawn(async move {
+                        client.run().await;
+                    });
+                    client_n += 1;
+                },
+                Err(e) => {
+                    event!(Level::WARN,
+                        "error accepting client: {}", &e
+                    );
+                }
+            },
+
             evt = rx.recv() => {
                 event!(Level::TRACE,
                     "main rec'd {:?}", &evt
                 );
 
+                // None means that the channel from the client tasks has been
+                // `.close()`d, which
+                //      a) shouldn't happen
+                //      b) 
                 let evt = evt.expect("main channel received None");
                 match evt {
                     Event::Observation{ plate, road, limit, pos } => {
@@ -146,15 +175,6 @@ async fn main() {
                         } else if unid_clients.remove(&id).is_some() {
                             event!(Level::TRACE,
                                 "removed unidentified client {}", &id
-                            );
-                        }
-                        n_connected = n_connected.saturating_sub(1);
-                        event!(Level::DEBUG,
-                            "connected count: {}", &n_connected
-                        );
-                        if n_connected == 0 {
-                            event!(Level::DEBUG,
-                                "pending tickets: {:#?}", &tickets
                             );
                         }
                     },
@@ -201,32 +221,6 @@ async fn main() {
                             );
                         }
                     },
-                }
-            },
-
-            res = listener.accept() => match res {
-                Ok((stream, addr)) => {
-                    event!(Level::DEBUG,
-                        "accpted client {} from {:?}", &client_n, &addr
-                    );
-                    let (out_tx, out_rx) = mpsc::channel::<Infraction>(CHAN_SIZE);
-                    let client = Client::new(
-                        client_n, stream, tx.clone(), out_rx
-                    );
-                    unid_clients.insert(client_n, out_tx);
-                    tokio::spawn(async move {
-                        client.run().await;
-                    });
-                    client_n += 1;
-                    n_connected += 1;
-                    event!(Level::DEBUG,
-                        "connected count: {}", &n_connected
-                    );
-                },
-                Err(e) => {
-                    event!(Level::WARN,
-                        "error accepting client: {}", &e
-                    );
                 }
             },
         }
