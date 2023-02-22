@@ -95,8 +95,6 @@ async fn main() {
         .with(EnvFilter::from_default_env())
         .init();
 
-    // Receives Events from clients.
-    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
     // Holds channels to as-of-yet-unidentified clients.
     let mut unid_clients: BTreeMap<usize, mpsc::Sender<Infraction>> = BTreeMap::new();
     // Maps ids to Dispatchers.
@@ -114,8 +112,10 @@ async fn main() {
         "listening on {:?}",
         &listener.local_addr().unwrap()
     );
-
+    // Receives Events from clients.
+    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
     let mut client_n: usize = 0;
+    
     loop {
         tokio::select! {
             res = listener.accept() => match res {
@@ -148,7 +148,8 @@ async fn main() {
                 // None means that the channel from the client tasks has been
                 // `.close()`d, which
                 //      a) shouldn't happen
-                //      b) 
+                //      b) would prevent the program from functioning
+                // so we'll just go ahead and die if that happens.
                 let evt = evt.expect("main channel received None");
                 match evt {
                     Event::Observation{ plate, road, limit, pos } => {
@@ -186,7 +187,7 @@ async fn main() {
                             );
                         } else {
                             event!(Level::WARN,
-                                "no client with id {}", &id
+                                "no unidentified client with id {}", &id
                             );
                         }
                     },
