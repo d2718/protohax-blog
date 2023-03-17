@@ -103,6 +103,7 @@ async fn main() {
             },
             resp = rx.recv() => {
                 let resp = resp.expect("main channel closed");
+                event!(Level::TRACE, "main rec'd: {:?}", &resp);
                 if &resp.rtype == &PktType::Close {
                     if let Some(client) = clients.remove(resp.id()) {
                         respond(&sock, resp, client.addr).await;
