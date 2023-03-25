@@ -1,5 +1,5 @@
 /*!
-Types to be sent between tasks.
+Types to be sent between or otherwise used in common between tasks.
 */
 
 use std::{
@@ -11,8 +11,10 @@ use std::{
 
 use smallvec::SmallVec;
 
+/// Buffer length for storing incoming and outgoing messages.
 pub const BLOCK_SIZE: usize = 1024;
 pub const MAX_PACKET_SIZE: usize = 997;
+/// Maximum length (in digits) of numerical values in the protocol.
 pub const NUM_LENGTH: usize = 10;
 
 static ARR_WRITE_ERR: &str = "error writing to array";
@@ -157,7 +159,6 @@ impl Debug for Pkt {
             .field("data", &String::from_utf8_lossy(&self.data.as_ref()[..self.length]))
             .finish()
     }
-    
 }
 
 /// A response to be sent back to the client.

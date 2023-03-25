@@ -205,11 +205,15 @@ struct LineReverser {
     idstr: String,
     /// Holds the incoming byte stream.
     buffer: Vec<u8>,
-    /// 
+    /// Queues up generated data responses to be sent.
     queue: VecDeque<DataResponse>,
+    /// Position in the incoming byte stream.
     in_bytes: usize,
+    /// Position in the outgoing byte stream.
     out_bytes: usize,
+    /// Buffer offset up to which no newlines have been found.
     buffptr: usize,
+    /// Data responses whose acknowlegements are still pending.
     current_out: BTreeMap<usize, Arc<Response>>,
 }
 
@@ -227,16 +231,23 @@ impl LineReverser {
         }
     }
 
+    /// Return the Response that expects the supplied count in its
+    /// acknowlegement (if there is one).
     fn current_response(&self, count: usize) -> Option<Arc<Response>> {
         Some(self.current_out.get(&count)?.clone())
     }
 
+    /// Return the next as-of-yet unsent response (if there is one).
     fn next_response(&mut self) -> Option<DataResponse> {
         let dr = self.queue.pop_front()?;
         self.current_out.insert(dr.count, dr.response.clone());
         Some(dr)
     }
 
+    /// Register acknowlegement of the data packet with the given count.
+    ///
+    /// Will return an Err (with a close-session Response) if the given
+    /// count would apply to data that hasn't (or hasn't yet) been sent.
     fn ack(&mut self, count: usize) -> Result<(), Response> {
         if let Some(_) = self.current_out.remove(&count) {
             Ok(())
@@ -251,6 +262,10 @@ impl LineReverser {
         }
     }
 
+    /// Search through the internal buffer for a complete line; if found,
+    /// enqueue the appropriate reversed-text data Response (or series of
+    /// Responses, if it's a long line), and discard the sent portion from
+    /// the buffer.
     fn analyze_buffer(&mut self) {
         event!(Level::DEBUG,
             "{} analyzing buffer [{}..{}]",
@@ -285,6 +300,14 @@ impl LineReverser {
         }
     }
 
+    /// Read the data from the supplied packet; if there's any data in
+    /// the packet that immediately follows what we've already read, add
+    /// it to the buffer and send the appropriate ack.
+    ///
+    /// If there's any new data, this calls `.analyze_buffer()` to send a
+    /// Response if warranted. If there's a gap between what we already
+    /// have and the data in this packet, send an ack with our current
+    /// position in the byte stream.
     fn read_data(&mut self, d: Data) -> Result<Option<Response>, Response> {
         event!(Level::DEBUG,
             "{}: read_data([{} bytes]): in: {} out: {}, buffer: {}",
@@ -315,7 +338,11 @@ impl LineReverser {
             }
         }
         for w in data.windows(2) {
+            // If count < self.in_bytes, we're just iterating through data
+            // we already have.
             if count < self.in_bytes {
+                // This is safe because these are guaranteed to be windows
+                // of size 2.
                 count += match unsafe {
                     (w.get_unchecked(0), w.get_unchecked(1))
                 }{
@@ -335,6 +362,8 @@ impl LineReverser {
                     _ => 1,
                 }
             } else {
+                // This is safe because these are guaranteed to be windows
+                // of size 2.
                 match unsafe {
                     (w.get_unchecked(0), w.get_unchecked(1))
                 }{
@@ -377,9 +406,8 @@ impl LineReverser {
     }
 }
 
+/// Open and run a session with the given SessionId.
 pub async fn run(id: SessionId, tx: UnboundedSender<Arc<Response>>, mut rx: Receiver<Pkt>) {
-    // let mut cx_timeout = SleepTimer::new(0);
-    // cx_timeout.sleep(CONNECTION_TIMEOUT);
     let mut cx_timeout = Box::pin(tokio::time::sleep(CONNECTION_TIMEOUT));
     let mut timeouts = MultiTimer::new();
     let mut lr = LineReverser::new(id);
@@ -402,7 +430,6 @@ pub async fn run(id: SessionId, tx: UnboundedSender<Arc<Response>>, mut rx: Rece
                         return;
                     },
                 };
-                //cx_timeout.sleep(CONNECTION_TIMEOUT);
                 cx_timeout.as_mut().reset(Instant::now() + CONNECTION_TIMEOUT);
 
                 event!(Level::TRACE, "{} rec'd {:?}", &lr.idstr, &pkt);
