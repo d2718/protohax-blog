@@ -365,6 +365,8 @@ Finally, if a client identifies itself as a dispatcher, we'll remove our end of 
 
 And that's it. This was kind of a slog, but it works now. I'm also pretty pleased with some elements of the implementation, like the cancellation-safe `ClientMessage` reading method.
 
+I will mention again that if you want to look at the whole thing all together (instead of in the chunks presented in this series of posts), all the code for the problems I've covered are in [a GitHub repository](https://github.com/d2718/protohax-blog).
+
 ## Retrospective
 
 As I mentioned in a footnote in the first post, I had a bug[^two-bugs] in what ended up being the `Car::observed()` method that caused it to occasionally fail to issue a ticket when it should have. Unable to get any more log info from the _client_ end than what the Protohackers test page puts out, I made a couple of wrong guesses about what the problem was.

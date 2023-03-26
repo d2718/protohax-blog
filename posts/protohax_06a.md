@@ -33,6 +33,38 @@ We also have to support at least 150 clients.
 $ cargo new 06_speed --name speed
 ```
 
+Here's our `Cargo.toml`:
+
+```toml
+[package]
+name = "speed"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "^1", features = [
+    "io-util", "macros", "net", "rt", "sync", "time"
+] }
+tracing = "^0.1"
+tracing-subscriber = { version = "^0.3", features = ["env-filter"] }
+```
+
+We've switched from `log` and `env-logger` to [`tracing`](https://docs.rs/tracing/latest/tracing/) and [`tracing-subscriber`](https://docs.rs/tracing-subscriber/0.3.16/tracing_subscriber/). This doesn't make much of a difference, because we're not using any of the fancy `tracing` features; it just means that
+
+```rust
+log::debug!("This is a log message.");
+```
+
+becomes something like
+
+```rust
+event!(Level::DEBUG, "This is a log message.");
+```
+
+The only other dependency we have is [Tokio](https://tokio.rs/), with one new feature: `time`. This has a type that we are going to use to implement the heartbeat when we get to it.
+
+In the case that seeing the code one isolated chunk at a time isn't doing it for you, and at any point you'd like a wider view of anything, all the code for the problems that I have written about so far is in [a GitHub repository](https://github.com/d2718/protohax-blog).
+
 ## The Communication Protocol
 
 The cameras and dispatchers speak a binary protocol[^vaporators] that involves big-endian u8, u16, and u32 integers, as well as length-prefixed strings of 0-255 ASCII characters (and, in one place, a length-prefixed u16 array). Each message begins with a single byte value that determines its type, followed by zero or more specific fields that compose that type. We'll start by defining types to represent them then move on to reading and writing them.
