@@ -85,7 +85,10 @@ async fn main() {
                 let (pkt, addr) = tup;
                 if let Some(conn) = clients.get(pkt.id()) {
                     if let Err(e) = conn.tx.send(pkt).await {
-                        // FIX: This needs to shut down this connection.
+                        /* Ideally, here, we would shut down this task, but
+                        it's easier for us just to wait; it'll time out when
+                        it doesn't get any incoming messages for a while
+                        and shut itself */
                         event!(Level::ERROR,"error sending to client: {}", &e)
                     }
                 } else {

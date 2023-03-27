@@ -1,6 +1,6 @@
-title: Protohackers in Rust, Part 07
-subtitle: The Future Episode
-time: 2023-03-23 22:08:00
+title: Protohackers in Rust, Part 07 (a)
+subtitle: The Future Episode (subpart a: Architecture, Types, and the Main Task)
+time: 2023-03-26 13:41:00
 og_image: https://d2718.net/blog/images/rust_logo.png
 og_desc: More async Rust in action solving the seventh Protohackers problem
 mathjax: true
@@ -91,7 +91,7 @@ ASCII art!
 
 ```text
                 ┌-----------------------------------┐                        ┌-----------------------------┐
-                |                                   |-->--| mpsc |-->-- -->--|                             |
+                |                                   |-->--| mpsc |-->-->-->--|                             |
                 |                                   |                        |     Single Session Task     |
                 |                                   |                        |     -------------------     |
                 |                                   |                        |                             |
@@ -244,8 +244,9 @@ heap allocations, and we'd like to avoid that.
 Enter the [`SmallVec`](https://docs.rs/smallvec/latest/smallvec/struct.SmallVec.html);
 it's like a `Vec`, but uses an array as a backing store, and won't allocate on the
 heap until it's filled up that array. So we'll use a `SmallVec` with a 10-byte
-backing array. We'll wrap it in a newtype and implement `Borrow<[u8]>` so that
-we can do lookups on the `BTreeMap` using byte slices.
+backing array. We'll wrap it in a newtype and implement 
+[`Borrow<[u8]>`](https://doc.rust-lang.org/std/borrow/trait.Borrow.htmlBTreeMap)
+for it so we can do map key lookups on it using byte slices.
 
 ```rust
 /// Maximum length (in digits) of numerical values in the protocol.
@@ -452,3 +453,285 @@ impl Debug for Response {
 }
 ```
 
+The main task will get these from the session tasks, look up their outgoing
+addresses by IP, and send the `.bytes()` data.
+
+## The main task
+
+The function of the main task is pretty simple; it has to respond to two
+types of events.
+
+  1. a UDP packet coming in
+  2. a `Response` coming from one of the session tasks
+
+When a UDP packet comes in, it needs to parse it enough to route it (that is,
+into a `Pkt`), then it looks the session ID up in its map. If there's an
+entry in the map for that session ID, it sends the `Pkt` on down the channel
+in that entry. If there's _not_ an entry, and the message is a `/connect/`
+message, then it'll create an entry in the map and start a new session task.
+(If the message isn't a `/connect/` message, we'll ignore it; either the
+client is misbehaving, or the original `/connect/` packet got lost, and the
+client should re-send it.)
+
+When a `Response` comes down the return channel from the session tasks, we'll
+look up the session ID in our map to get the return address and send out
+the data. If it's a `/close/` message, we'll remove that entry from our
+map because we don't need it anymore.
+
+So let's get writing. Here's the top of `src/main.rs`. The `lrl` module is
+the one with all the session logic, which we'll get to later.
+
+```rust
+/*!
+Protohackers Problem 7: Line Reversal
+
+Implement the [Line Reversal Control
+Protocol](https://protohackers.com/problem/7).
+*/
+
+use std::{
+    sync::Arc,
+    collections::BTreeMap,
+    net::SocketAddr,
+};
+
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc::{channel, unbounded_channel, Sender},
+};
+use tracing::{event, Level};
+use tracing_subscriber::{filter::EnvFilter, fmt::layer, prelude::*};
+
+mod lrl;
+mod types;
+
+use crate::{
+    types::{MsgBlock, Pkt, PktType, Response, SessionId},
+};
+
+static LOCAL_ADDR: &str = "0.0.0.0:12321";
+/// Size of channels leading from the main task to the session tasks.
+const CHAN_SIZE: usize = 4;
+```
+
+First up is a function to read a message from our UDP socket. We are going to
+be ignoring malformed messages (the spec says so), and we will be `select!`ing
+on this function, so it just loops trying to read packets until it gets a
+good one.
+
+```rust
+/**
+Read the contents of a single UDP packet from the socket and parse it enough
+to return a `Pkt`.
+
+Also returns the return `SocketAddr` of the client that sent the packet, in
+case we don't already have it.
+
+Per the protocol, nonconforming packets should be ignored, so this function
+doesn't return a `Result`; it just keeps trying to read and parse packets
+until it can return a good one.
+*/
+async fn read_pkt(sock: &UdpSocket) -> (Pkt, SocketAddr) {
+    loop {
+        let mut data = MsgBlock::new();
+        let (length, addr) = match sock.recv_from(&mut data.as_mut()).await {
+            Err(e) => {
+                event!(Level::ERROR, "error reading from socket: {}", &e);
+                continue;
+            },
+            Ok((length, addr)) => (length, addr),
+        };
+        match Pkt::new(data, length) {
+            Ok(p) => return (p, addr),
+            Err(e) => {
+                event!(Level::ERROR, "error creating Pkt: {}", &e);
+            },
+        };
+    }
+}
+```
+
+Following that, we have essentially its counterpart: a function to send
+a response out on the socket. Again, it doesn't return any errors, it
+just logs them.
+
+```rust
+/**
+Write the data of the supplied `Response` to the supplied address.
+
+This function logs, but doesn't return errors. If it's a correctable error,
+the client will request the message again; if it's not, what are we going
+to do about it?
+*/
+async fn respond(sock: &UdpSocket, r: Arc<Response>, addr: SocketAddr) {
+    match sock.send_to(r.bytes(), addr).await {
+        Ok(n) => if n != r.bytes().len() {
+            event!(Level::ERROR,
+                "only sent {} bytes of {} byte Response",
+                &n, &r.bytes().len()
+            );
+        },
+        Err(e) => {
+            event!(Level::ERROR,
+                "error sending {:?}: {}", &r, &e
+            );
+        },
+    }
+}
+```
+
+Next, we have a little struct to hold routing information for our sessions.
+These will be the values in our map thats indexed by `SessionId`.
+
+```rust
+/// Holds routing information for a single session.
+///
+/// In retrospect, this probably should have been called a `Session`, but
+/// in this context they're almost equivalent.
+struct Client {
+    /// channel to the session task
+    tx: Sender<Pkt>,
+    /// return address of client
+    addr: SocketAddr,
+}
+```
+
+No constructor or accessors or anything; this is just data.
+
+Now here's the beginning of our `main()` function. We start the logging
+machinery, instantiate our return[^return_channel] `mpsc` channel, bind
+our socket, and then we start our main `select!` loop. We'll go through
+each arm of the loop individually in a bit.
+
+[^return_channel]: That is, session -> main.
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    tracing_subscriber::registry()
+        .with(layer())
+        .with(EnvFilter::from_default_env())
+        .init();
+    
+    // Receives Responses from individual tasks.
+    let (tx, mut rx) = unbounded_channel::<Arc<Response>>();
+    // Holds channels to individual tasks.
+    let mut clients: BTreeMap<SessionId, Client> = BTreeMap::new();
+
+    let sock = UdpSocket::bind(LOCAL_ADDR).await.expect("unable to bind socket");
+    event!(Level::INFO,
+        "listening on {:?}",
+        sock.local_addr().expect("socket has no local address")
+    );
+
+    loop {
+        tokio::select!{
+
+        // select! arms go here
+
+        }
+    }
+}
+```
+
+You may notice that the return channel here is of type
+[`UnboundedReceiver<Arc<Response>>``](https://docs.rs/tokio/latest/tokio/sync/mpsc/struct.UnboundedReceiver.html).
+It's "unbounded" so it can hold as many responses as it needs to and not
+clog up any of the session tasks by getting full. It also carries
+`Arc<Response>`s (as opposed to just `Response`s); because any individual
+resposne may need to be sent multiple times, instead of cloning them
+repeatedly, we'll just stick'em in an `Arc` and pass the references around.
+
+The first arm is the packet-reading one. If we get a good packet, we'll pass
+it on if we have routing info for it, and if not, we'll create a channel,
+store the routing data in a `Client` in our `BTreeMap`, and start a session
+task. We don't exactly know how we're going to start a client task yet, so
+we'll leave that part `unimplemented!()`.
+
+```rust
+async fn main() {
+
+    // ... snip ...
+
+    loop {
+        tokio::select!{
+            tup = read_pkt(&sock) => {
+                let (pkt, addr) = tup;
+                if let Some(conn) = clients.get(pkt.id()) {
+                    if let Err(e) = conn.tx.send(pkt).await {
+                        /* Ideally, here, we would shut down this task, but
+                        it's easier for us just to wait; it'll time out when
+                        it doesn't get any incoming messages for a while
+                        and shut itself down. */
+                        event!(Level::ERROR,"error sending to client: {}", &e)
+                    }
+                } else {
+                    let id = SessionId::from(pkt.id());
+                    let (task_tx, task_rx) = channel::<Pkt>(CHAN_SIZE);
+                    task_tx.send(pkt).await.unwrap();
+                    let client = Client {
+                        tx: task_tx, addr,
+                    };
+                    clients.insert(id.clone(), client);
+
+                    // start a session task
+                    unimplemented!()
+                    
+                }
+            },
+
+            // one more select! arm goes here
+            
+        }
+    }
+}
+```
+
+The other `select!` arm will handle receiving a `Response` from the return
+channel. If it's a `/close/` response, we'll remove that session's routing
+info from our map (so it'll get dropped, because we don't need it anymore);
+otherwise we'll just look up the routing info so we know the correct `SocketAddr`
+to aim it at, and send the response data out through the socket.
+
+```rust
+async fn main() {
+
+    // ... snip ...
+
+    loop {
+        tokio::select!{
+
+            // packet receiving select! arm elided
+
+            resp = rx.recv() = {
+                // If the return channel has somehow gotten closed, the
+                // program can't continue to function, so we'll just die.
+                let resp = resp.expect("main channel closed");
+                event!(Level::TRACE, "main rec'd: {:?}", &resp);
+                if &resp.rtype == &PktType::Close {
+                    if let Some(client) = clients.remove(resp.id()) {
+                        respond(&sock, resp, client.addr).await;
+                    } else {
+                        event!(Level::ERROR,
+                            "no Client with ID {:?}", resp.id()
+                        );
+                    }
+                } else {
+                    if let Some(client) = clients.get(resp.id()) {
+                        respond(&sock, resp, client.addr).await;
+                    } else {
+                        event!(Level::ERROR,
+                            "no Client with ID {:?}", resp.id()
+                        );
+                    }
+                }
+            },
+        }
+    }
+}
+```
+
+And I'm going to call it there for today. We didn't really have to do or even
+think about anything particularly hard, but there's a lot to do _next_ time;
+the session tasks are a lot more involved, and deserve an entire post of
+their own.
